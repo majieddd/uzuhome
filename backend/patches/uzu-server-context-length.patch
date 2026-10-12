@@ -1,0 +1,81 @@
+diff --git a/crates/legacy/cli/src/main.rs b/crates/legacy/cli/src/main.rs
+index 99a7321..2b2c744 100644
+--- a/crates/legacy/cli/src/main.rs
++++ b/crates/legacy/cli/src/main.rs
+@@ -61,6 +61,10 @@ enum Commands {
+         /// Print verbose information into the file log
+         #[arg(long)]
+         verbose_file_log: bool,
++        /// Context window in tokens. Defaults to the model's recommended length, which is 16384 on GPUs
++        /// without sparse buffers.
++        #[arg(long, value_name = "TOKENS")]
++        context_length: Option<u32>,
+     },
+     Storage {
+         #[arg(long, value_enum, default_value_t = storage::DownloadManagerCliType::default())]
+@@ -89,7 +93,11 @@ async fn main() -> Result<()> {
+             prefix_cache,
+             no_prefix_cache,
+             verbose_file_log,
+-        }) => server::run_server(model, host, port, prefix_cache || !no_prefix_cache, verbose_file_log).await?,
++            context_length,
++        }) => {
++            server::run_server(model, host, port, prefix_cache || !no_prefix_cache, verbose_file_log, context_length)
++                .await?
++        },
+         Some(Commands::Storage {
+             download_manager,
+         }) => storage::run(download_manager).await?,
+diff --git a/crates/legacy/cli/src/server/runner.rs b/crates/legacy/cli/src/server/runner.rs
+index e58d1ab..34641b7 100644
+--- a/crates/legacy/cli/src/server/runner.rs
++++ b/crates/legacy/cli/src/server/runner.rs
+@@ -16,7 +16,7 @@ use tokio::{
+ };
+ use uzu::{
+     engine::{Engine, EngineConfig},
+-    types::session::chat::ChatConfig,
++    types::{basic::ContextLength, session::chat::ChatConfig},
+ };
+ 
+ use crate::{
+@@ -157,6 +157,7 @@ pub async fn run_server(
+     port: u16,
+     prefix_cache: bool,
+     verbose_file_logs: bool,
++    context_length: Option<u32>,
+ ) -> Result<()> {
+     let file_logger = if verbose_file_logs {
+         let cache_dir = std::env::var_os("XDG_CACHE_HOME")
+@@ -187,8 +188,13 @@ pub async fn run_server(
+     spinner.finish_with_message(format!("Loaded: {}", resolved.identifier));
+ 
+     let thinking_support = ThinkingSupport::for_model(&resolved);
+-    let session =
+-        engine.chat(resolved.clone(), ChatConfig::default()).await.context("Failed to create chat session")?;
++    let chat_config = match context_length {
++        Some(length) => ChatConfig::default().with_context_length(ContextLength::Custom {
++            length: i64::from(length),
++        }),
++        None => ChatConfig::default(),
++    };
++    let session = engine.chat(resolved.clone(), chat_config).await.context("Failed to create chat session")?;
+     let model_name = resolved.identifier.clone();
+     let state = ServerState {
+         model_name: model_name.clone(),
+@@ -218,6 +224,7 @@ pub async fn run_server(
+             "🚀 OpenAI-compatible server v{version} for model: {model_name}\n",
+             "🌐 Available at: http://{host}:{port}\n",
+             "🗄️  Prefix cache: {prefix_cache_enabled}\n",
++            "📏 Context: {context}\n",
+             "📝 Endpoints:\n",
+             "   POST /v1/chat/completions (or /chat/completions)\n",
+             "   GET  /v1/models           (or /models)\n",
+@@ -227,6 +234,7 @@ pub async fn run_server(
+         host = host,
+         port = port,
+         prefix_cache_enabled = prefix_cache_enabled,
++        context = context_length.map_or_else(|| "model default".to_string(), |length| format!("{length} tokens")),
+     );
+ 
+     let rocket = rocket::custom(config)

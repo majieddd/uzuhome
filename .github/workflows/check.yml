@@ -1,0 +1,19 @@
+name: Build and checks
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Endpoint gateway tests (mock uzu server, no model)
+        run: python3 -m unittest discover -s tools -p test_gateway.py -v
+      - name: Backend scripts parse
+        run: for f in backend/bin/uzuctl backend/bin/uzu-update backend/bin/uzu-engine backend/bin/uzu-convert backend/bin/uzu-build-engine backend/install.sh; do bash -n "$f"; done
+      - name: Build (without the engine; releases bundle it)
+        run: UZU_HOME_NO_ENGINE=1 ./build.sh
+      - name: Self-test
+        run: '"dist/uzu Home.app/Contents/MacOS/UzuHome" --selftest'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UzuHome
+          path: dist/UzuHome.zip

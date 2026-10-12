@@ -1,0 +1,61 @@
+#!/bin/bash
+# uzu-convert REPO [--name NAME] [--identity TEXT] — convert a Qwen3.5 MLX build from Hugging Face for uzu and add it to
+# models.conf. The first run sets up lalamo (Mirai's converter, about 0.7 GB) in its own Python environment with uv.
+# The converted model goes to models/NAME; the download stays in the Hugging Face cache.
+set -euo pipefail
+source "$(dirname "$(readlink -f "$0")")/uzu-common.sh"
+load_config
+LALAMO_DIR="$ROOT/lalamo"
+LALAMO_COMMIT=831accb8252a6b6606c378048caeb44178f1a050
+LIB="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/lib"
+step() { printf '\n==> %s\n' "$*"; }
+exec > >(tee -a "$LOGS/convert.log") 2>&1
+
+repo=${1:-}
+shift || true
+name="" identity=""
+while (($#)); do
+  case $1 in
+    --name) name=${2:-}; shift 2 ;;
+    --identity) identity=${2:-}; shift 2 ;;
+    *) echo "unknown option $1" >&2; exit 2 ;;
+  esac
+done
+[[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "usage: uzuctl convert OWNER/REPO [--name NAME] [--identity TEXT]" >&2; exit 2; }
+if [[ -z $name ]]; then
+  name=${repo#*/}
+  name=$(printf '%s' "$name" | sed -E 's/[-_.]?(mlx|MLX)([-_.]?[0-9]+[-_]?[bB]it)?//g; s/[-_.]?[0-9]+[-_]?[bB]it$//')
+fi
+name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '-' | sed -E 's/-+/-/g; s/^-|-$//g')
+[[ -n $name ]] || { echo "could not make a folder name from $repo; pass --name" >&2; exit 2; }
+out="$ROOT/models/$name"
+echo "uzu-convert: $(date '+%F %T') $repo -> $out"
+
+if ! command -v uv >/dev/null; then
+  command -v brew >/dev/null || { echo "uv is needed to set up the converter. Install Homebrew (brew.sh) or uv (docs.astral.sh/uv)." >&2; exit 3; }
+  step "Installing uv (Python environments) with Homebrew"
+  brew install uv
+fi
+if [[ ! -x $LALAMO_DIR/.venv/bin/python ]] || [[ $(git -C "$LALAMO_DIR" rev-parse HEAD 2>/dev/null) != "$LALAMO_COMMIT" ]]; then
+  step "Setting up lalamo, Mirai's model converter (first time only)"
+  [[ -d $LALAMO_DIR/.git ]] || git clone --quiet https://github.com/trymirai/lalamo.git "$LALAMO_DIR"
+  git -C "$LALAMO_DIR" fetch --quiet origin
+  git -C "$LALAMO_DIR" checkout --quiet --force "$LALAMO_COMMIT"
+  (cd "$LALAMO_DIR" && uv sync --no-dev --frozen --python 3.12)
+fi
+
+mkdir -p "$ROOT/models"
+# plain HTTP downloads resume reliably on slow or flaky connections
+HF_HUB_DISABLE_XET=1 "$LALAMO_DIR/.venv/bin/python" -I "$LIB/convert.py" "$repo" "$out" "$ROOT/share/hanashi" \
+  ${identity:+--identity "$identity"}
+
+key=$(printf '%s' "$name" | tr 'A-Z' 'a-z')
+label="$name (converted from $repo)"
+if grep -v '^\s*#' "$ROOT/models.conf" | awk -F'|' -v m="$out" '$4 == m { found = 1 } END { exit !found }'; then
+  echo "uzu-convert: $name was already listed; its files are refreshed"
+else
+  while model_line "$key" >/dev/null 2>&1; do key="$key-2"; done
+  printf '%s|%s|local|%s\n' "$key" "${label//|//}" "$out" >>"$ROOT/models.conf"
+  echo "uzu-convert: added $key to the model list"
+fi
+echo "uzu-convert: done. Select it on the Server tab, or: uzuctl use $key"

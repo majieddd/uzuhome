@@ -1,0 +1,9 @@
+# build output: the app zip is attached to GitHub Releases, not committed
+dist/
+# the uzu engine is built by tools/build-engine.sh and bundled by build.sh
+engine/uzu
+engine/VERSION
+*.log
+__pycache__/
+*.pyc
+.DS_Store

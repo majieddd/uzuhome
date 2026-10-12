@@ -1,0 +1,24 @@
+#!/bin/bash
+# launchd entry point for the uzu engine: serves the configured model on the internal port.
+set -euo pipefail
+source "$(dirname "$(readlink -f "$0")")/uzu-common.sh"
+load_config
+trim_log "$LOGS/engine.log"
+
+line=$(model_line "$MODEL") || { echo "uzu-engine: unknown model '$MODEL' (see models.conf)" >&2; exit 2; }
+IFS='|' read -r key label source ref <<<"$line"
+[[ -x $ENGINE_BIN ]] || { echo "uzu-engine: no engine at $ENGINE_BIN; run Set up" >&2; exit 2; }
+if [[ $source == local && ! -f $ref/config.json ]]; then
+  echo "uzu-engine: $label: no converted model in $ref" >&2
+  exit 2
+fi
+
+# Read the weights through once in the background: sequential reads fill the file cache at the SSD's full speed, where
+# the engine's own first touches of a cold file are much slower (a 9B model took ~40 s to load cold, ~2 s cached).
+if [[ $source == local ]]; then dir=$ref; else dir=$(ls -d "$HOME/.cache/mirai/models/mirai/${ref//:/-}"/*/ 2>/dev/null | tail -1); fi
+for f in "${dir%/}/model.safetensors" "${dir%/}/speculator/model.safetensors"; do
+  [[ -f $f ]] && { cat "$f" >/dev/null 2>&1 & }
+done
+
+echo "uzu-engine: $(date '+%F %T') starting $label ($source: $ref) with uzu $(engine_version) on 127.0.0.1:$ENGINE_PORT, context $CONTEXT, $SESSIONS sessions"
+exec "$ENGINE_BIN" server --model "$ref" --host 127.0.0.1 --port "$ENGINE_PORT" --context-length "$CONTEXT" --sessions "$SESSIONS"

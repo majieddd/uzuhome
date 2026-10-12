@@ -1,0 +1,302 @@
+diff --git a/crates/legacy/cli/src/main.rs b/crates/legacy/cli/src/main.rs
+index 2b2c7449..a4e642a4 100644
+--- a/crates/legacy/cli/src/main.rs
++++ b/crates/legacy/cli/src/main.rs
+@@ -65,6 +65,10 @@ enum Commands {
+         /// without sparse buffers.
+         #[arg(long, value_name = "TOKENS")]
+         context_length: Option<u32>,
++        /// Conversations kept at once. Each holds its own context; a request continues the one it extends, and one
++        /// that extends none replaces the least recently used. One request runs at a time either way.
++        #[arg(long, value_name = "N", default_value_t = 1)]
++        sessions: usize,
+     },
+     Storage {
+         #[arg(long, value_enum, default_value_t = storage::DownloadManagerCliType::default())]
+@@ -94,9 +98,18 @@ async fn main() -> Result<()> {
+             no_prefix_cache,
+             verbose_file_log,
+             context_length,
++            sessions,
+         }) => {
+-            server::run_server(model, host, port, prefix_cache || !no_prefix_cache, verbose_file_log, context_length)
+-                .await?
++            server::run_server(
++                model,
++                host,
++                port,
++                prefix_cache || !no_prefix_cache,
++                verbose_file_log,
++                context_length,
++                sessions,
++            )
++            .await?
+         },
+         Some(Commands::Storage {
+             download_manager,
+diff --git a/crates/legacy/cli/src/server/chat_completions.rs b/crates/legacy/cli/src/server/chat_completions.rs
+index 43cfb8b2..1a728446 100644
+--- a/crates/legacy/cli/src/server/chat_completions.rs
++++ b/crates/legacy/cli/src/server/chat_completions.rs
+@@ -30,6 +30,7 @@ use crate::{
+     common::thinking::ThinkingSupport,
+     server::{
+         ServerState,
++        state::SessionPool,
+         chat_tool_calls::{
+             OaiTool, OaiToolCall, ToolCallStreamer, ToolParameterTypes, backfill_tool_result_names, choose_tools,
+             coerce_tool_call, insert_tools_message, oai_tool_call, parse_parameter_text, reply_tool_calls,
+@@ -704,6 +705,32 @@ fn messages_have_prefix(
+         })
+ }
+ 
++/// Picks the pool's session for a request: the one whose history the request
++/// extends (the longest such history), otherwise the least recently used one,
++/// which prepare_input then resets. Call it while holding the pool's turn.
++async fn pick_session(
++    pool: &SessionPool,
++    messages: &[ChatMessage],
++    prefix_cache: bool,
++) -> Arc<Mutex<ChatSession>> {
++    let mut best: Option<(usize, usize)> = None;
++    if prefix_cache {
++        for (index, session) in pool.sessions.iter().enumerate() {
++            let current = session.lock().await.messages().await;
++            if !current.is_empty()
++                && messages.len() > current.len()
++                && messages_have_prefix(messages, &current)
++                && best.is_none_or(|(_, length)| current.len() > length)
++            {
++                best = Some((index, current.len()));
++            }
++        }
++    }
++    let index = best.map_or_else(|| pool.least_recently_used(), |(index, _)| index);
++    pool.mark_used(index);
++    Arc::clone(&pool.sessions[index])
++}
++
+ /// Returns only the messages the session has not seen yet when the request
+ /// extends the session's current history; otherwise resets the session and
+ /// returns the full list. Token-level reuse itself is decided inside the
+@@ -739,7 +766,7 @@ async fn cancel_and_drain(stream: &ChatSessionStream) {
+ }
+ 
+ async fn run_blocking(
+-    session: Arc<Mutex<ChatSession>>,
++    pool: Arc<SessionPool>,
+     messages: Vec<ChatMessage>,
+     config: ChatReplyConfig,
+     id: String,
+@@ -757,12 +784,12 @@ async fn run_blocking(
+     // keeps forcing that write while the request queues and generates.
+     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(3));
+ 
+-    // Requests serialize on the single session, so a client can disconnect
++    // Requests serialize on the pool's turn, so a client can disconnect
+     // while still queued; generating for it would block everyone behind it.
+-    let mut lock = std::pin::pin!(session.lock());
+-    let session = loop {
++    let mut lock = std::pin::pin!(Arc::clone(&pool.turn).lock_owned());
++    let _turn = loop {
+         tokio::select! {
+-            session = &mut lock => break session,
++            turn = &mut lock => break turn,
+             () = sender.closed() => {
+                 log.fail("client disconnected");
+                 return;
+@@ -772,6 +799,8 @@ async fn run_blocking(
+             },
+         }
+     };
++    let session = pick_session(&pool, &messages, prefix_cache).await;
++    let session = session.lock().await;
+     let input = match prepare_input(&session, messages, prefix_cache).await {
+         Ok(input) => input,
+         Err(error) => {
+@@ -872,7 +901,7 @@ async fn run_blocking(
+ }
+ 
+ async fn run_stream(
+-    session: Arc<Mutex<ChatSession>>,
++    pool: Arc<SessionPool>,
+     messages: Vec<ChatMessage>,
+     config: ChatReplyConfig,
+     id: String,
+@@ -884,14 +913,16 @@ async fn run_stream(
+     log: RequestLog,
+ ) {
+     // Same as the blocking path: don't start generating for a client that
+-    // disconnected while queued on the session.
+-    let session = tokio::select! {
+-        session = session.lock() => session,
++    // disconnected while queued for its turn.
++    let _turn = tokio::select! {
++        turn = Arc::clone(&pool.turn).lock_owned() => turn,
+         () = sender.closed() => {
+             log.fail("client disconnected");
+             return;
+         },
+     };
++    let session = pick_session(&pool, &messages, prefix_cache).await;
++    let session = session.lock().await;
+     let has_tools = messages.iter().any(|message| !message.tool_namespaces().is_empty());
+     let input = match prepare_input(&session, messages, prefix_cache).await {
+         Ok(input) => input,
+@@ -1221,20 +1252,20 @@ pub async fn handle_chat_completions(
+ 
+     let id = request_info.id.as_str().to_owned();
+     if is_stream {
+-        let session = Arc::clone(&state.session);
++        let pool = Arc::clone(&state.sessions);
+         let (sender, receiver) = mpsc::unbounded_channel::<Event>();
+         tokio::spawn(
+-            run_stream(session, messages, config, id, model, created, state.prefix_cache, parameter_types, sender, log)
++            run_stream(pool, messages, config, id, model, created, state.prefix_cache, parameter_types, sender, log)
+                 .in_current_span(),
+         );
+         let body: Pin<Box<dyn Stream<Item = Event> + Send>> = Box::pin(UnboundedReceiverStream::new(receiver));
+         ChatCompletionResult::Stream(EventStream::from(body))
+     } else {
+-        let session = Arc::clone(&state.session);
++        let pool = Arc::clone(&state.sessions);
+         let (sender, receiver) = mpsc::unbounded_channel::<Vec<u8>>();
+         tokio::spawn(
+             run_blocking(
+-                session,
++                pool,
+                 messages,
+                 config,
+                 id,
+diff --git a/crates/legacy/cli/src/server/mod.rs b/crates/legacy/cli/src/server/mod.rs
+index ed97ac33..90ded394 100644
+--- a/crates/legacy/cli/src/server/mod.rs
++++ b/crates/legacy/cli/src/server/mod.rs
+@@ -11,4 +11,4 @@ pub mod state;
+ pub use chat_completions::handle_chat_completions;
+ pub use models::handle_models;
+ pub use runner::run_server;
+-pub use state::ServerState;
++pub use state::{ServerState, SessionPool};
+diff --git a/crates/legacy/cli/src/server/runner.rs b/crates/legacy/cli/src/server/runner.rs
+index 34641b76..80f2d5d1 100644
+--- a/crates/legacy/cli/src/server/runner.rs
++++ b/crates/legacy/cli/src/server/runner.rs
+@@ -10,10 +10,7 @@ use rocket::{
+     response::Body,
+     routes,
+ };
+-use tokio::{
+-    io::{AsyncRead, ReadBuf},
+-    sync::Mutex,
+-};
++use tokio::io::{AsyncRead, ReadBuf};
+ use uzu::{
+     engine::{Engine, EngineConfig},
+     types::{basic::ContextLength, session::chat::ChatConfig},
+@@ -22,7 +19,7 @@ use uzu::{
+ use crate::{
+     common::thinking::ThinkingSupport,
+     server::{
+-        ServerState, handle_chat_completions, handle_models,
++        ServerState, SessionPool, handle_chat_completions, handle_models,
+         log::{self, FileLogger},
+         request_info::RequestInfo,
+     },
+@@ -158,6 +155,7 @@ pub async fn run_server(
+     prefix_cache: bool,
+     verbose_file_logs: bool,
+     context_length: Option<u32>,
++    sessions: usize,
+ ) -> Result<()> {
+     let file_logger = if verbose_file_logs {
+         let cache_dir = std::env::var_os("XDG_CACHE_HOME")
+@@ -194,11 +192,16 @@ pub async fn run_server(
+         }),
+         None => ChatConfig::default(),
+     };
+-    let session = engine.chat(resolved.clone(), chat_config).await.context("Failed to create chat session")?;
++    // One loaded model, several conversation states on it (each holds its own context window).
++    let instance = engine.chat_instance(resolved.clone(), chat_config).await.context("Failed to load the model")?;
++    let mut pool = Vec::with_capacity(sessions.max(1));
++    for _ in 0..sessions.max(1) {
++        pool.push(engine.chat_with_instance(&instance).await.context("Failed to create chat session")?);
++    }
+     let model_name = resolved.identifier.clone();
+     let state = ServerState {
+         model_name: model_name.clone(),
+-        session: Arc::new(Mutex::new(session)),
++        sessions: Arc::new(SessionPool::new(pool)),
+         thinking_support,
+         prefix_cache,
+     };
+@@ -225,6 +228,7 @@ pub async fn run_server(
+             "🌐 Available at: http://{host}:{port}\n",
+             "🗄️  Prefix cache: {prefix_cache_enabled}\n",
+             "📏 Context: {context}\n",
++            "🧵 Sessions: {sessions}\n",
+             "📝 Endpoints:\n",
+             "   POST /v1/chat/completions (or /chat/completions)\n",
+             "   GET  /v1/models           (or /models)\n",
+@@ -235,6 +239,7 @@ pub async fn run_server(
+         port = port,
+         prefix_cache_enabled = prefix_cache_enabled,
+         context = context_length.map_or_else(|| "model default".to_string(), |length| format!("{length} tokens")),
++        sessions = sessions.max(1),
+     );
+ 
+     let rocket = rocket::custom(config)
+diff --git a/crates/legacy/cli/src/server/state.rs b/crates/legacy/cli/src/server/state.rs
+index a6fbd3d7..f83b097f 100644
+--- a/crates/legacy/cli/src/server/state.rs
++++ b/crates/legacy/cli/src/server/state.rs
+@@ -1,4 +1,7 @@
+-use std::sync::Arc;
++use std::{
++    sync::{Arc, Mutex as StdMutex},
++    time::Instant,
++};
+ 
+ use tokio::sync::Mutex;
+ use uzu::session::chat::ChatSession;
+@@ -7,7 +10,39 @@ use crate::common::thinking::ThinkingSupport;
+ 
+ pub struct ServerState {
+     pub model_name: String,
+-    pub session: Arc<Mutex<ChatSession>>,
++    pub sessions: Arc<SessionPool>,
+     pub thinking_support: ThinkingSupport,
+     pub prefix_cache: bool,
+ }
++
++/// Chat sessions over one loaded model, each with its own conversation state. Requests still run one at a time
++/// (`turn`); each goes to the session whose conversation it continues, so a short side request (a chat title, say)
++/// does not discard the long prompt another conversation has already read.
++pub struct SessionPool {
++    pub turn: Arc<Mutex<()>>,
++    pub sessions: Vec<Arc<Mutex<ChatSession>>>,
++    last_used: StdMutex<Vec<Instant>>,
++}
++
++impl SessionPool {
++    pub fn new(sessions: Vec<ChatSession>) -> Self {
++        let now = Instant::now();
++        Self {
++            turn: Arc::new(Mutex::new(())),
++            last_used: StdMutex::new(vec![now; sessions.len()]),
++            sessions: sessions.into_iter().map(|session| Arc::new(Mutex::new(session))).collect(),
++        }
++    }
++
++    pub fn least_recently_used(&self) -> usize {
++        let last_used = self.last_used.lock().expect("last_used lock");
++        last_used.iter().enumerate().min_by_key(|(_, used)| **used).map_or(0, |(index, _)| index)
++    }
++
++    pub fn mark_used(
++        &self,
++        index: usize,
++    ) {
++        self.last_used.lock().expect("last_used lock")[index] = Instant::now();
++    }
++}

@@ -1,0 +1,162 @@
+#!/bin/bash
+# uzu-update — keep the uzu engine current, with a health check and rollback.
+#   uzu-update            update now
+#   uzu-update --check    only report whether a newer uzu release exists and how it would be installed
+#   uzu-update --auto     scheduled run (launchd): quiet unless something changed or failed
+# A newer uzu release is installed from Mirai's ready-made build when it runs on this macOS and has the server's
+# --context-length and --sessions options; otherwise it is built from source with uzu Home's patch when rustup and Xcode's Metal
+# toolchain are here; otherwise the next uzu Home release brings it. The engine it replaces is kept as engine/previous
+# and put back if the new one does not start.
+set -uo pipefail
+source "$(dirname "$(readlink -f "$0")")/uzu-common.sh"
+load_config
+mode=${1:-now}
+API=${UZU_RELEASES_API:-https://api.github.com/repos/trymirai/uzu/releases/latest}
+ASSET=mirai-aarch64-apple-darwin.tar.gz
+WORK="$STATE/engine-update"
+results=() # "component|before|after|status"
+failed=0 changed=0
+
+log() { echo "uzu-update: $(date '+%F %T') $*"; }
+py() { "$PYTHON" -c "$@"; }
+
+version_gt() { # version_gt A B -> 0 when A is newer than B (numeric dotted parts)
+  py 'import sys
+def p(v): return [int("".join(c for c in x if c.isdigit()) or 0) for x in v.lstrip("v").split("+")[0].split(".")]
+a, b = p(sys.argv[1]), p(sys.argv[2])
+n = max(len(a), len(b)); a += [0] * (n - len(a)); b += [0] * (n - len(b))
+sys.exit(0 if a > b else 1)' "$1" "$2"
+}
+
+gateway_inflight() {
+  /usr/bin/curl -fsS --max-time 3 "http://127.0.0.1:$GATEWAY_PORT/uzu/status" 2>/dev/null |
+    py 'import json,sys; print(json.load(sys.stdin).get("inflight", 0))' 2>/dev/null || echo 0
+}
+
+engine_healthy() { # the binary runs and has the server options uzu Home needs
+  [[ ${UZU_UPDATE_SIMULATE_FAILURE:-} == engine ]] && return 1 # test hook for the rollback path
+  local help
+  help=$("$1" server --help 2>/dev/null) && grep -q -- --context-length <<<"$help" && grep -q -- --sessions <<<"$help"
+}
+
+runs_here() { # the binary's minimum macOS is not newer than this Mac's
+  local minos os
+  minos=$(vtool -show-build "$1" 2>/dev/null | awk '/minos/ {print $2; exit}')
+  os=$(sw_vers -productVersion)
+  [[ -n $minos ]] && ! version_gt "$minos" "$os"
+}
+
+can_build() { { [[ -x $HOME/.cargo/bin/cargo ]] || command -v cargo >/dev/null; } && xcrun --find metal >/dev/null 2>&1; }
+
+before=$(engine_version)
+before_tag=${before%%+*}
+release=$(/usr/bin/curl -fsS --max-time 20 -H 'Accept: application/vnd.github+json' "$API" 2>/dev/null)
+latest=$(printf '%s' "$release" | py 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null)
+
+install_candidate() { # install_candidate BINARY VERSION HOW
+  mkdir -p "$ROOT/engine/previous"
+  [[ -x $ENGINE_BIN ]] && cp -p "$ENGINE_BIN" "$ROOT/engine/previous/uzu"
+  [[ -f $ROOT/engine/VERSION ]] && cp -p "$ROOT/engine/VERSION" "$ROOT/engine/previous/VERSION"
+  cp "$1" "$ENGINE_BIN.new" && chmod 755 "$ENGINE_BIN.new" && mv "$ENGINE_BIN.new" "$ENGINE_BIN"
+  printf '%s\n' "$2" >"$ROOT/engine/VERSION"
+  log "installed uzu $2 ($3); the previous engine is in engine/previous"
+}
+
+rollback() {
+  [[ -x $ROOT/engine/previous/uzu ]] || return 1
+  cp -p "$ROOT/engine/previous/uzu" "$ENGINE_BIN"
+  [[ -f $ROOT/engine/previous/VERSION ]] && cp -p "$ROOT/engine/previous/VERSION" "$ROOT/engine/VERSION"
+  log "rolled back to uzu $(engine_version)"
+}
+
+if [[ -z $latest ]]; then
+  failed=1
+  results+=("uzu engine|$before||could not check GitHub")
+elif ! version_gt "$latest" "$before_tag"; then
+  results+=("uzu engine|$before|$before|current")
+else
+  rm -rf "$WORK" && mkdir -p "$WORK"
+  how="" candidate="" candidate_version=""
+  # 1. Mirai's ready-made build, verified against the SHA-256 GitHub publishes for it
+  url=$(printf '%s' "$release" | py "import json,sys
+for a in json.load(sys.stdin).get('assets', []):
+    if a.get('name') == '$ASSET': print(a.get('browser_download_url', '') + ' ' + (a.get('digest') or ''))" 2>/dev/null)
+  read -r asset_url digest <<<"$url"
+  if [[ -n ${asset_url:-} && ${digest:-} == sha256:* ]] &&
+    /usr/bin/curl -fsSL --max-time 300 -o "$WORK/$ASSET" "$asset_url" 2>/dev/null &&
+    [[ $(shasum -a 256 "$WORK/$ASSET" | cut -d' ' -f1) == "${digest#sha256:}" ]] &&
+    tar -xzf "$WORK/$ASSET" -C "$WORK" 2>/dev/null; then
+    official=$(find "$WORK" -type f -perm -u+x -name 'mirai*' | head -1)
+    if [[ -n $official ]] && runs_here "$official" && engine_healthy "$official"; then
+      candidate=$official candidate_version="$latest+official" how="Mirai's build"
+    else
+      log "Mirai's $latest build does not fit (needs a newer macOS or lacks --context-length)"
+    fi
+  fi
+  # 2. a source build with uzu Home's patch
+  if [[ -z $candidate ]] && can_build; then
+    how="source build"
+    if [[ $mode == --check ]]; then
+      candidate=check
+    else
+      log "building uzu $latest from source (a few minutes)"
+      if /bin/bash "$ROOT/bin/uzu-build-engine" "$latest" "$WORK/build" >>"$LOGS/update.log" 2>&1 && engine_healthy "$WORK/build/uzu"; then
+        candidate="$WORK/build/uzu" candidate_version=$(cat "$WORK/build/VERSION")
+      else
+        log "the source build of $latest failed; see this log"
+      fi
+    fi
+  fi
+  if [[ -z $candidate ]]; then
+    status="available: needs the next uzu Home release"
+    can_build && status="available: the source build failed"
+    [[ $mode == --check ]] || { [[ $status == *failed* ]] && failed=1; }
+    results+=("uzu engine|$before|$latest|$status")
+  elif [[ $mode == --check ]]; then
+    results+=("uzu engine|$before|$latest|available ($how)")
+  else
+    install_candidate "$candidate" "$candidate_version" "$how"
+    if engine_healthy "$ENGINE_BIN"; then
+      changed=1
+      results+=("uzu engine|$before|$candidate_version|updated")
+    else
+      rollback; failed=1
+      results+=("uzu engine|$before|$candidate_version|rolled back")
+    fi
+  fi
+  [[ $mode == --check ]] || rm -rf "$WORK"
+fi
+
+# --- restart the engine on the new version when it is loaded and idle; roll back if it does not come up -------------
+if ((changed)) && is_loaded "$ENGINE_LABEL"; then
+  if [[ $(gateway_inflight) == 0 ]]; then
+    log "restarting the engine on the new version"
+    if ! "$ROOT/bin/uzuctl" engine restart >/dev/null 2>&1; then
+      log "the engine did not start on the new version"
+      rollback && "$ROOT/bin/uzuctl" engine restart >/dev/null 2>&1
+      failed=1
+      results+=("uzu engine|$(engine_version)||rolled back after a failed start")
+    fi
+  else
+    log "engine busy; the new version loads at its next start"
+  fi
+fi
+
+# --- report ------------------------------------------------------------------------------------------------------
+summary=$(printf '%s\n' "${results[@]}" | py '
+import json, sys, datetime
+rows = [l.rstrip("\n").split("|") for l in sys.stdin if l.strip()]
+changed = [r for r in rows if r[3] != "current"]
+summary = "the engine is up to date" if not changed else "; ".join(f"{r[0]} {r[1]}->{r[2]} {r[3]}" for r in changed)
+doc = {"checked_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), "mode": sys.argv[1], "summary": summary,
+       "ok": sys.argv[2] == "0", "components": [dict(zip(("name", "before", "after", "status"), r)) for r in rows]}
+open(sys.argv[3], "w").write(json.dumps(doc, indent=1))
+print(summary)' "$mode" "$failed" "$STATE/update.json")
+
+log "$summary"
+for r in "${results[@]}"; do IFS='|' read -r n b a s <<<"$r"; printf '  %-12s %-24s %-24s %s\n' "$n" "$b" "$a" "$s"; done
+if [[ $mode == --auto ]]; then
+  ((failed)) && notify "uzu engine update problem: $summary"
+  ((changed)) && ((!failed)) && notify "uzu engine updated: $summary"
+fi
+exit $failed

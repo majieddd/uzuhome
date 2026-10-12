@@ -1,0 +1,278 @@
+#!/bin/bash
+# uzuctl — control uzu Home's backend (the uzu engine, the endpoint and the updater) from Terminal.
+set -uo pipefail
+source "$(dirname "$(readlink -f "$0")")/uzu-common.sh"
+load_config
+AGENTS="$HOME/Library/LaunchAgents"
+
+usage() {
+  cat <<EOF
+usage: uzuctl COMMAND
+
+  up                    start the endpoint and warm the engine (unless the model loads on first request)
+  down                  stop the engine (the endpoint stays if ENDPOINT_AT_LOGIN=1)
+  status [--json]       show what is running
+  use MODEL             switch model (restarts the engine if it is running)
+  models                list models from models.conf
+  catalog               list the chat models in Mirai's catalog (id, size, name)
+  add ID [LABEL]        add a model from Mirai's catalog, e.g. alibaba:qwen3.5:4b:mirai:mirai-l:8
+  convert REPO [--name NAME] [--identity TEXT]
+                        convert a Qwen3.5 MLX build from Hugging Face for uzu and add it
+  add-folder PATH [LABEL]
+                        add a folder that is already in uzu's format (config.json, encoding.json, weights)
+  remove MODEL          take a model off the list (its files stay)
+  thinking on|off       whether the model thinks when a request does not say
+  context TOKENS        context window (restarts the engine if it is running)
+  sessions 1|2|3|4      conversations kept at once (restarts the engine if it is running)
+  idle MINUTES          stop the engine after this many idle minutes (0 = never)
+  mode always|idle|ondemand [MINUTES]
+                        keep the model loaded / unload when idle / load on first request (and unload when idle)
+  share on|off          serve the endpoint to other computers on the network (restarts the endpoint)
+  key on|off|generate|show
+                        require an API key from other computers (this Mac never needs it)
+  autoupdate on|off     the daily check for a new uzu engine
+  engine start|stop|restart [--no-wait]
+  gateway start|stop|restart
+  login on|off          keep the endpoint running from login
+  update [--check]      update the uzu engine now
+  endpoint              print connection details for Hermes and other clients
+  logs [engine|gateway|update|convert]
+  install-agents        (re)write launchd agents after editing config.env
+EOF
+}
+
+new_key() { printf 'sk-uzu-%s\n' "$(openssl rand -hex 20)"; }
+
+plist_path() { # plist_path LABEL
+  case $1 in
+    "$GATEWAY_LABEL") [[ $ENDPOINT_AT_LOGIN == 1 ]] && echo "$AGENTS/$1.plist" || echo "$ROOT/launchd/$1.plist" ;;
+    "$UPDATER_LABEL") echo "$AGENTS/$1.plist" ;;
+    *) echo "$ROOT/launchd/$1.plist" ;;
+  esac
+}
+
+xml() { local s=${1//&/&amp;}; s=${s//</&lt;}; printf '%s' "${s//>/&gt;}"; }
+
+write_plist() { # write_plist LABEL PROGRAM LOG KEEPALIVE(crash|always|none) [extra xml]
+  local label=$1 program=$2 log=$3 keep=$4 extra=${5:-} file
+  file=$(plist_path "$label")
+  mkdir -p "$(dirname "$file")"
+  local keepxml='<dict><key>SuccessfulExit</key><false/></dict>'
+  [[ $keep == always ]] && keepxml='<true/>'
+  [[ $keep == none ]] && keepxml='<false/>'
+  cat >"$file" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key><array>$program</array>
+  <key>RunAtLoad</key><$([[ $keep == none ]] && echo false || echo true)/>
+  <key>KeepAlive</key>$keepxml
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$(xml "$log")</string>
+  <key>StandardErrorPath</key><string>$(xml "$log")</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>$PATH</string>
+    <key>UZU_HOME_ROOT</key><string>$(xml "$ROOT")</string>
+  </dict>
+  $extra
+</dict>
+</plist>
+EOF
+}
+
+install_agents() {
+  # Interactive: launchd otherwise throttles a job's disk reads, and loading a 6 GB model takes minutes instead of seconds
+  write_plist $ENGINE_LABEL "<string>/bin/bash</string><string>$(xml "$ROOT/bin/uzu-engine")</string>" "$LOGS/engine.log" crash \
+    "<key>ProcessType</key><string>Interactive</string>"
+  rm -f "$AGENTS/$GATEWAY_LABEL.plist" "$ROOT/launchd/$GATEWAY_LABEL.plist"
+  write_plist $GATEWAY_LABEL "<string>$(xml "$PYTHON")</string><string>$(xml "$ROOT/bin/uzu-gateway.py")</string>" "$LOGS/gateway.log" always
+  write_plist $UPDATER_LABEL "<string>/bin/bash</string><string>$(xml "$ROOT/bin/uzu-update")</string><string>--auto</string>" "$LOGS/update.log" none \
+    "<key>StartCalendarInterval</key><dict><key>Hour</key><integer>$UPDATE_HOUR</integer><key>Minute</key><integer>$UPDATE_MINUTE</integer></dict>
+  <key>ProcessType</key><string>Background</string><key>LowPriorityIO</key><true/>"
+  # the updater runs daily when AUTO_UPDATE=1; the gateway runs from login only with ENDPOINT_AT_LOGIN=1
+  launchctl bootout "$DOMAIN/$UPDATER_LABEL" 2>/dev/null
+  if [[ $AUTO_UPDATE == 1 ]]; then launchctl bootstrap "$DOMAIN" "$(plist_path $UPDATER_LABEL)"; else rm -f "$(plist_path $UPDATER_LABEL)"; fi
+}
+
+svc_start() { # svc_start LABEL
+  is_loaded "$1" && return 0
+  [[ -f $(plist_path "$1") ]] || install_agents
+  launchctl bootstrap "$DOMAIN" "$(plist_path "$1")"
+}
+svc_stop() { is_loaded "$1" && launchctl bootout "$DOMAIN/$1" 2>/dev/null; return 0; }
+
+wait_for() { # wait_for URL SECONDS
+  local deadline=$((SECONDS + $2))
+  while ((SECONDS < deadline)); do http_ok "$1" && return 0; sleep 0.5; done
+  return 1
+}
+
+engine_up() { http_ok "http://127.0.0.1:$ENGINE_PORT/v1/models"; }
+gateway_up() { http_ok "http://127.0.0.1:$GATEWAY_PORT/health"; }
+
+engine_cmd() {
+  case ${1:-} in
+    start)
+      svc_start $ENGINE_LABEL
+      [[ ${2:-} == --no-wait ]] && return 0
+      echo "starting $(model_field "$MODEL" 2)…"
+      # a first start downloads the model, so allow for that
+      wait_for "http://127.0.0.1:$ENGINE_PORT/v1/models" 1800 && echo "engine ready" || { echo "engine did not become ready; see $LOGS/engine.log" >&2; return 1; } ;;
+    stop) svc_stop $ENGINE_LABEL; echo "engine stopped" ;;
+    restart) svc_stop $ENGINE_LABEL; sleep 1; engine_cmd start "${2:-}" ;;
+    *) usage; return 2 ;;
+  esac
+}
+
+gateway_cmd() {
+  case ${1:-} in
+    start) svc_start $GATEWAY_LABEL && wait_for "http://127.0.0.1:$GATEWAY_PORT/health" 30 ;;
+    stop) svc_stop $GATEWAY_LABEL ;;
+    restart) svc_stop $GATEWAY_LABEL; sleep 1; svc_start $GATEWAY_LABEL && wait_for "http://127.0.0.1:$GATEWAY_PORT/health" 30 ;;
+    *) usage; return 2 ;;
+  esac
+}
+
+cmd_status() {
+  if [[ ${1:-} == --json ]]; then
+    /usr/bin/curl -fsS --max-time 3 "http://127.0.0.1:$GATEWAY_PORT/uzu/status" 2>/dev/null ||
+      echo "{\"gateway\":\"stopped\",\"engine\":\"$(engine_up && echo running || echo stopped)\"}"
+    return
+  fi
+  printf 'model     %s (%s)\n' "$(model_field "$MODEL" 2)" "$MODEL"
+  printf 'endpoint  http://127.0.0.1:%s/v1  model id "%s"  context %s  [%s]\n' "$GATEWAY_PORT" "$SERVED_NAME" "$CONTEXT" "$(gateway_up && echo up || echo down)"
+  printf 'engine    uzu %s, %s (memory mode %s, idle %s min)\n' "$(engine_version)" "$(engine_up && echo running || echo stopped)" "$MEMORY_MODE" "$IDLE_MINUTES"
+  printf 'thinking  %s\n' "$THINKING"
+  [[ -f $STATE/update.json ]] && printf 'updates   %s\n' "$("$PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("summary",""), "·", d.get("checked_at",""))' "$STATE/update.json" 2>/dev/null)"
+  return 0
+}
+
+restart_if_running() { if is_loaded $ENGINE_LABEL; then engine_cmd restart "${1:-}"; fi; }
+
+cmd=${1:-status}; shift || true
+case $cmd in
+  up)
+    svc_start $GATEWAY_LABEL
+    [[ $MEMORY_MODE == ondemand ]] || engine_up || svc_start $ENGINE_LABEL # warm the model while the UI loads
+    wait_for "http://127.0.0.1:$GATEWAY_PORT/health" 30 ;;
+  down)
+    svc_stop $ENGINE_LABEL
+    [[ $ENDPOINT_AT_LOGIN == 1 ]] || svc_stop $GATEWAY_LABEL
+    echo "stopped" ;;
+  status) cmd_status "${1:-}" ;;
+  use)
+    [[ -n ${1:-} ]] && model_line "$1" >/dev/null || { echo "unknown model '${1:-}'; try: uzuctl models" >&2; exit 2; }
+    set_config MODEL "$1"; MODEL=$1
+    echo "model set to $(model_field "$1" 2)"
+    restart_if_running "${2:-}" ;;
+  models)
+    grep -v '^\s*#' "$ROOT/models.conf" | while IFS='|' read -r key label source ref; do
+      [[ -z $key ]] && continue
+      printf '%s %-18s %-46s %-6s %s\n' "$([[ $key == "$MODEL" ]] && echo '*' || echo ' ')" "$key" "$label" "$source" "$ref"
+    done ;;
+  catalog) "$PYTHON" "$ROOT/lib/catalog.py" ;;
+  add)
+    id=${1:-}
+    [[ $id =~ ^[a-z0-9._-]+(:[a-z0-9._-]+){3,}$ ]] || { echo "usage: uzuctl add CATALOG_ID [LABEL]  (see: uzuctl catalog)" >&2; exit 2; }
+    grep -v '^\s*#' "$ROOT/models.conf" | awk -F'|' -v m="$id" '$4 == m { found = 1 } END { exit !found }' && { echo "already listed: $id" >&2; exit 1; }
+    key=$(printf '%s' "$id" | awk -F: '{ q = $NF; sub(/^mirai-/, "", $(NF-1)); print $2 "-" $3 "-" $(NF-1) }' | tr -c 'a-z0-9.\n-' '-')
+    while model_line "$key" >/dev/null 2>&1; do key="$key-2"; done
+    label=${2:-$("$PYTHON" "$ROOT/lib/catalog.py" --label "$id" 2>/dev/null || echo "$id")}
+    printf '%s|%s|mirai|%s\n' "$key" "${label//|//}" "$id" >>"$ROOT/models.conf"
+    echo "added $key: $label (downloads on the first start)" ;;
+  convert) exec /bin/bash "$ROOT/bin/uzu-convert" "$@" ;;
+  add-folder)
+    dir=${1:-}
+    [[ -n $dir ]] || { echo "usage: uzuctl add-folder PATH [LABEL]" >&2; exit 2; }
+    dir=$(cd "$dir" 2>/dev/null && pwd) || { echo "no folder at ${1}" >&2; exit 1; }
+    [[ -f $dir/config.json && -f $dir/encoding.json ]] || { echo "$dir is not a uzu model folder (it needs config.json and encoding.json)" >&2; exit 1; }
+    grep -v '^\s*#' "$ROOT/models.conf" | awk -F'|' -v m="$dir" '$4 == m { found = 1 } END { exit !found }' && { echo "already listed: $dir" >&2; exit 1; }
+    key=$(basename "$dir" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9.\n-' '-')
+    while model_line "$key" >/dev/null 2>&1; do key="$key-2"; done
+    label=${2:-$(basename "$dir")}
+    [[ -f $dir/speculator/model.safetensors && -z ${2:-} ]] && label="$label (with speculator)"
+    printf '%s|%s|local|%s\n' "$key" "${label//|//}" "$dir" >>"$ROOT/models.conf"
+    echo "added $key: $label" ;;
+  remove)
+    [[ -n ${1:-} ]] && model_line "$1" >/dev/null || { echo "unknown model '${1:-}'" >&2; exit 2; }
+    [[ $1 == "$MODEL" ]] && { echo "$1 is the current model; switch to another one first" >&2; exit 1; }
+    tmp=$(mktemp)
+    awk -F'|' -v k="$1" '$1 != k' "$ROOT/models.conf" >"$tmp" && mv "$tmp" "$ROOT/models.conf"
+    echo "removed $1 from the list (its files are kept)" ;;
+  thinking)
+    [[ ${1:-} == on || ${1:-} == off ]] || { echo "usage: uzuctl thinking on|off" >&2; exit 2; }
+    set_config THINKING "$1"; echo "thinking $1 when a request does not say" ;;
+  context)
+    [[ ${1:-} =~ ^[0-9]+$ ]] && (($1 >= 4096 && $1 <= 262144)) || { echo "usage: uzuctl context TOKENS (4096 to 262144)" >&2; exit 2; }
+    set_config CONTEXT "$1"; echo "context $1 tokens"
+    restart_if_running "${2:-}" ;;
+  sessions)
+    [[ ${1:-} =~ ^[1-4]$ ]] || { echo "usage: uzuctl sessions 1|2|3|4" >&2; exit 2; }
+    set_config SESSIONS "$1"; echo "$1 conversation$([[ $1 == 1 ]] || echo s) kept at once"
+    restart_if_running "${2:-}" ;;
+  idle)
+    [[ ${1:-} =~ ^[0-9]+$ ]] || { echo "usage: uzuctl idle MINUTES" >&2; exit 2; }
+    set_config IDLE_MINUTES "$1"; echo "engine stops after $1 idle minutes (0 = never)" ;;
+  mode)
+    case ${1:-} in
+      always) set_config MEMORY_MODE always ;;
+      idle | ondemand)
+        set_config MEMORY_MODE "$1"
+        [[ ${2:-} =~ ^[0-9]+$ ]] && set_config IDLE_MINUTES "$2"
+        load_config; ((IDLE_MINUTES > 0)) || set_config IDLE_MINUTES 10 ;;
+      *) echo "usage: uzuctl mode always|idle|ondemand [MINUTES]" >&2; exit 2 ;;
+    esac
+    load_config; echo "memory mode $MEMORY_MODE (idle minutes $IDLE_MINUTES)" ;;
+  share)
+    [[ ${1:-} == on || ${1:-} == off ]] || { echo "usage: uzuctl share on|off" >&2; exit 2; }
+    set_config SHARE_ON_NETWORK "$([[ $1 == on ]] && echo 1 || echo 0)"
+    if [[ $1 == on && ! -s $STATE/api_key ]]; then (umask 077; new_key >"$STATE/api_key"); fi
+    is_loaded $GATEWAY_LABEL && gateway_cmd restart >/dev/null
+    echo "network sharing $1" ;;
+  key)
+    case ${1:-show} in
+      on) set_config REQUIRE_KEY 1; [[ -s $STATE/api_key ]] || (umask 077; new_key >"$STATE/api_key") ;;
+      off) set_config REQUIRE_KEY 0 ;;
+      generate) (umask 077; new_key >"$STATE/api_key") ;;
+      show) cat "$STATE/api_key" 2>/dev/null; echo; exit 0 ;;
+      *) echo "usage: uzuctl key on|off|generate|show" >&2; exit 2 ;;
+    esac
+    echo "API key required from other computers: $(grep -q '^REQUIRE_KEY=1' "$ROOT/config.env" && echo yes || echo no)" ;;
+  autoupdate)
+    [[ ${1:-} == on || ${1:-} == off ]] || { echo "usage: uzuctl autoupdate on|off" >&2; exit 2; }
+    set_config AUTO_UPDATE "$([[ $1 == on ]] && echo 1 || echo 0)"; load_config
+    install_agents; echo "automatic engine updates $1" ;;
+  engine) engine_cmd "$@" ;;
+  gateway) gateway_cmd "${1:-}" ;;
+  login)
+    [[ ${1:-} == on || ${1:-} == off ]] || { echo "usage: uzuctl login on|off" >&2; exit 2; }
+    running=0; is_loaded $GATEWAY_LABEL && running=1
+    svc_stop $GATEWAY_LABEL
+    set_config ENDPOINT_AT_LOGIN "$([[ $1 == on ]] && echo 1 || echo 0)"; load_config
+    install_agents
+    { [[ $1 == on ]] || ((running)); } && svc_start $GATEWAY_LABEL
+    echo "endpoint at login: $1" ;;
+  update) exec /bin/bash "$ROOT/bin/uzu-update" "$@" ;;
+  endpoint)
+    cat <<EOF
+Base URL (OpenAI):     http://127.0.0.1:$GATEWAY_PORT/v1
+Model id:              $SERVED_NAME   (any name works; it is rewritten)
+API key:               none needed on this Mac (send any value if a client insists)
+Context window:        $CONTEXT tokens
+Loaded model:          $(model_field "$MODEL" 2)
+
+Hermes (~/.hermes/config.yaml):
+  model:
+    provider: custom
+    base_url: http://127.0.0.1:$GATEWAY_PORT/v1
+    default: $SERVED_NAME
+    context_length: $CONTEXT
+EOF
+    ;;
+  logs) f="$LOGS/${1:-engine}.log"; [[ -f $f ]] && tail -n 60 "$f" || echo "no log at $f" ;;
+  install-agents) install_agents; echo "launchd agents written to $ROOT/launchd and $AGENTS" ;;
+  -h | --help | help) usage ;;
+  *) usage; exit 2 ;;
+esac

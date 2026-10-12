@@ -1,0 +1,37 @@
+#!/bin/bash
+# uzu-build-engine TAG OUT_DIR — build Mirai's uzu CLI at a release tag with uzu Home's patches (the server's
+# --context-length and --sessions options; structured output that engages after a Qwen-style "</think>"), and put it in OUT_DIR/uzu
+# with OUT_DIR/VERSION (TAG+COMMIT.p<first 6 hex of the patches' SHA-256>). Used by tools/build-engine.sh for releases
+# and by uzu-update when no ready-made engine fits this Mac. Needs rustup and Xcode's Metal toolchain.
+#   UZU_BUILD_SRC   where the uzu checkout is kept (default: $ROOT/src/uzu)
+#   UZU_PATCHES     the patches folder (default: the patches folder next to bin/)
+set -euo pipefail
+source "$(dirname "$(readlink -f "$0")")/uzu-common.sh"
+TAG=${1:?usage: uzu-build-engine TAG OUT_DIR}
+OUT=${2:?usage: uzu-build-engine TAG OUT_DIR}
+SRC=${UZU_BUILD_SRC:-$ROOT/src/uzu}
+PATCHES=${UZU_PATCHES:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/patches}
+[[ -f $HOME/.cargo/env ]] && source "$HOME/.cargo/env"
+command -v cargo >/dev/null || { echo "uzu-build-engine: rustup is needed (https://rustup.rs)" >&2; exit 3; }
+xcrun --find metal >/dev/null 2>&1 || { echo "uzu-build-engine: Xcode's Metal toolchain is needed" >&2; exit 3; }
+
+if [[ ! -d $SRC/.git ]]; then
+  mkdir -p "$(dirname "$SRC")"
+  git clone --quiet https://github.com/trymirai/uzu.git "$SRC"
+fi
+git -C "$SRC" fetch --quiet --tags --force origin
+git -C "$SRC" checkout --quiet --force "refs/tags/$TAG"
+git -C "$SRC" clean --quiet -fd crates
+for p in "$PATCHES"/*.patch; do
+  [[ -f $p ]] || continue
+  git -C "$SRC" apply --check "$p" || { echo "uzu-build-engine: $(basename "$p") does not apply to uzu $TAG" >&2; exit 4; }
+  git -C "$SRC" apply "$p"
+done
+(cd "$SRC" && cargo build --release --locked -p cli)
+mkdir -p "$OUT"
+cp "$SRC/target/release/cli" "$OUT/uzu"
+codesign --force --sign - "$OUT/uzu" 2>/dev/null
+"$OUT/uzu" server --help | grep -q -- --context-length && "$OUT/uzu" server --help | grep -q -- --sessions ||
+  { echo "uzu-build-engine: the build lacks --context-length or --sessions" >&2; exit 5; }
+printf '%s+%s.p%s\n' "$TAG" "$(git -C "$SRC" rev-parse --short HEAD)" "$(cat "$PATCHES"/*.patch | shasum -a 256 | cut -c1-6)" >"$OUT/VERSION"
+echo "uzu-build-engine: built uzu $(cat "$OUT/VERSION") in $OUT"

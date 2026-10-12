@@ -1,0 +1,15 @@
+diff --git a/crates/legacy/uzu/src/engine/bridge/helpers.rs b/crates/legacy/uzu/src/engine/bridge/helpers.rs
+index df9f03f..3f7dbb5 100644
+--- a/crates/legacy/uzu/src/engine/bridge/helpers.rs
++++ b/crates/legacy/uzu/src/engine/bridge/helpers.rs
+@@ -50,7 +50,9 @@ pub fn get_grammar(
+ /// grammar must stay disengaged until this sequence has been generated.
+ #[cfg(feature = "capability-grammar")]
+ pub fn grammar_trigger_token_sequence<B: Backend>(model: &LanguageModel<B>) -> Option<Vec<u64>> {
+-    let tag = model.end_of_thinking_tag()?;
++    // The tag's surrounding whitespace tokenizes differently in context ("\n\n</think>" is two tokens, not three), so
++    // a trigger that includes it is never found in the prompt or the stream; the tag itself always is.
++    let tag = model.end_of_thinking_tag()?.trim();
+     let token_ids: Vec<u64> =
+         model.tokenizer().encode(tag, false).ok()?.get_ids().iter().map(|token_id| u64::from(*token_id)).collect();
+     (!token_ids.is_empty()).then_some(token_ids)
