@@ -242,10 +242,76 @@ def _model_details(model):
         return info
     info.update(path=path, size_gb=round(dir_bytes(path) / 1e9, 2),
                 speculator=os.path.exists(os.path.join(path, "speculator", "model.safetensors")))
+    info.update(memory_facts(path))
     sidecar = read_json(os.path.join(path, "uzu-home.json"), {})
     if sidecar.get("source_repo"):
         info["converted_from"] = sidecar["source_repo"]
     return info
+
+
+def _attention_kv_bytes(config):
+    """KV-cache bytes one token takes in every attention layer of a lalamo config (bf16 keys and values)."""
+    total, longest = 0, None
+
+    def walk(node):
+        nonlocal total, longest
+        if isinstance(node, dict):
+            if node.get("type") == "AttentionConfig":
+                total += 2 * int(node.get("num_groups") or node.get("num_heads") or 0) * int(node.get("head_dim") or 0) * 2
+            rope = node.get("rope_config")
+            if isinstance(rope, dict) and rope.get("max_sequence_length"):
+                longest = max(longest or 0, int(rope["max_sequence_length"]))
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(config)
+    return total, longest
+
+
+def memory_facts(path):
+    """What the context estimate needs: the model's longest context, KV bytes per token (model and speculator, which
+    each keep their own cache), and the weights uzu holds. uzu reserves the whole window for every session at load."""
+    facts = {}
+    kv, longest = _attention_kv_bytes(read_json(os.path.join(path, "config.json"), {}))
+    if longest:
+        facts["max_context"] = longest
+    spec_kv, _ = _attention_kv_bytes(read_json(os.path.join(path, "speculator", "config.json"), {}))
+    if kv:
+        facts["kv_bytes_per_token"] = kv + spec_kv
+    weights = 0
+    for rel in ("model.safetensors", os.path.join("speculator", "model.safetensors")):
+        try:
+            weights += os.stat(os.path.join(path, rel)).st_size
+        except OSError:
+            pass
+    if weights:
+        facts["weights_bytes"] = weights
+    return facts
+
+
+def engine_reserves_context(version):
+    """uzu 0.6.3 sets the whole window aside for every session when the model loads; from 0.6.17 the KV cache grows as a
+    conversation fills (measured on a 9B Qwen3.5: 8.1 GB loaded at 128K, 12 GB once a 70K-token prompt was read)."""
+    try:
+        tag = tuple(int(x) for x in (version or "0").split("+")[0].lstrip("v").split("."))
+    except ValueError:
+        return False
+    return tag < (0, 6, 17)
+
+
+def process_footprint(pid):
+    """A process's physical footprint in bytes (what Activity Monitor calls Memory), from footprint(1)."""
+    try:
+        out = subprocess.run(["/usr/bin/footprint", "-p", str(pid)], capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return None
+    m = re.search(r"phys_footprint:\s+([\d.]+)\s*([KMG])B", out)
+    if not m:
+        return None
+    return int(float(m.group(1)) * {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}[m.group(2)])
 
 
 def launchd_engine():
@@ -341,6 +407,9 @@ def scan_event(ev, live):
         live.finish = (ev.get("response") or {}).get("status") or etype.split(".")[-1]
 
 
+OVERFLOW_FILE = os.path.join(STATE, "overflows.json")
+
+
 class Recorder:
     """Live requests, the last 200 finished ones, totals, a 2-minute history and the per-version perf log."""
 
@@ -352,6 +421,29 @@ class Recorder:
                        "prefill_s": 0.0, "decode_s": 0.0}
         self.history = {k: collections.deque(maxlen=HISTORY) for k in ("t", "tok_s", "prefill_tok_s", "inflight")}
         self.last_prefill = None
+        saved = read_json(OVERFLOW_FILE, {})
+        self.overflows = saved if isinstance(saved, dict) and "count" in saved else {"count": 0}
+
+    def overflow(self, live, context, estimate):
+        """A request that did not fit the context window: counted, with the largest size seen, for the app's hint."""
+        with self.lock:
+            o = self.overflows
+            o["count"] = o.get("count", 0) + 1
+            o["last_at"] = time.time()
+            o["last_estimate"] = estimate
+            o["context_at_last"] = context
+            if o.get("largest_context") != context:  # sizes seen at an older window say nothing about this one
+                o["largest_context"], o["largest_estimate"] = context, estimate
+            elif estimate and estimate > (o.get("largest_estimate") or 0):
+                o["largest_estimate"] = estimate
+            o["client"] = live.client if live else None
+            snapshot = dict(o)
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            with open(OVERFLOW_FILE, "w") as fh:
+                json.dump(snapshot, fh)
+        except OSError:
+            pass
 
     def begin(self, live):
         with self.lock:
@@ -377,7 +469,8 @@ class Recorder:
         prefill = read / ttft if ttft and read else None
         steps = u.get("spec_verify_ct")
         per_step = output / steps if steps and output else None
-        finish = "error" if error else "cancel" if cancelled else (live.finish or ("stop" if 200 <= status < 300 else "error"))
+        finish = "overflow" if getattr(live, "overflowed", False) else "error" if error else "cancel" if cancelled else \
+            (live.finish or ("stop" if 200 <= status < 300 else "error"))
         rec = {
             "id": live.id, "time": end, "start": live.start, "path": live.path, "client": live.client, "stream": live.stream,
             "status": status, "finish": finish, "error": error,
@@ -390,7 +483,7 @@ class Recorder:
             "model": cfg["model"]["key"], "model_label": cfg["model"]["label"], "source": cfg["model"]["source"],
             "engine_version": version,
         }
-        if prompt is None and output is None and finish != "error":
+        if prompt is None and output is None and finish not in ("error", "overflow"):
             return rec  # nothing generated (a probe, or a request without a body we understand)
         with self.lock:
             self.requests.appendleft(rec)
@@ -486,6 +579,7 @@ class Engine:
 
     def __init__(self, recorder):
         self.rec = recorder
+        self.load_bytes = self.load_context = self.load_sessions = self.load_model = None
         self.lock = threading.Lock()
         self.starting = False
         self.last_activity = time.time()
@@ -552,6 +646,16 @@ class Engine:
         _details_cache.pop(cfg["model"]["ref"], None)  # the first start may just have downloaded it
         self.model_info = model_details(cfg["model"])
         self.model_key = cfg["model"]["key"]
+        self.load_bytes = None
+        threading.Thread(target=self.measure_load, args=(cfg,), daemon=True).start()
+
+    def measure_load(self, cfg):
+        """The engine's memory a few seconds after it loaded, the base of the app's context estimate."""
+        time.sleep(3)
+        _, running, pid, _ = launchd_engine()
+        size = process_footprint(pid) if running and pid else None
+        if size:
+            self.load_bytes, self.load_context, self.load_sessions, self.load_model = size, cfg["context"], cfg["sessions"], cfg["model"]["key"]
 
     def poll_loop(self):
         """Every second: health and history; every IDLE_CHECK_S (20 s): the idle check."""
@@ -602,7 +706,7 @@ def status():
         "engine_version": ENGINE.version or engine_version(), "engine_up_since": ENGINE.up_since,
         "engine_facts": ENGINE.facts if state == "running" else {},
         "model": cfg["model"], "models": cfg["models"],
-        "model_info": ENGINE.model_info if ENGINE.model_key == cfg["model"]["key"] and ENGINE.model_info else model_details(cfg["model"]),
+        "model_info": memory_model(cfg, ENGINE.model_info if ENGINE.model_key == cfg["model"]["key"] and ENGINE.model_info else model_details(cfg["model"])),
         "served_name": cfg["served_name"], "context": cfg["context"], "sessions": cfg["sessions"], "thinking": cfg["thinking"],
         "memory_mode": cfg["memory_mode"], "idle_minutes": cfg["idle_minutes"],
         "idle_remaining_s": max(0, int(idle_s - (time.time() - ENGINE.last_activity)))
@@ -612,7 +716,25 @@ def status():
         "endpoint_at_login": cfg["endpoint_at_login"], "share": cfg["share"], "require_key": cfg["require_key"],
         "key_set": bool(api_key()), "listening": LISTEN_HOST, "auto_update": cfg["auto_update"], "update": update,
         "shared_defaults": defaults.get("defaults") if isinstance(defaults, dict) else None,
+        "overflows": dict(RECORDER.overflows),
     }
+
+
+def memory_model(cfg, info):
+    """Model details plus what the context estimate needs: base_bytes (the loaded model before any conversation) and
+    whether the engine sets each window aside at load. Measured after a load when there was one, else weights plus the
+    runtime this engine version takes."""
+    info = dict(info or {})
+    reserves = engine_reserves_context(ENGINE.version or engine_version())
+    info["reserves_context"] = reserves
+    kv = info.get("kv_bytes_per_token") or 0
+    if getattr(ENGINE, "load_bytes", None) and getattr(ENGINE, "load_model", None) == cfg["model"]["key"]:
+        reserved = kv * ENGINE.load_context * ENGINE.load_sessions if reserves else 0
+        info["base_bytes"] = max(0, ENGINE.load_bytes - reserved)
+        info["measured_load_bytes"] = ENGINE.load_bytes
+    elif info.get("weights_bytes"):
+        info["base_bytes"] = info["weights_bytes"] + (1_100_000_000 if reserves else 2_700_000_000)
+    return info
 
 
 def metrics():
@@ -707,6 +829,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.command == "POST":
                 apply_defaults(doc, path)
                 apply_thinking(doc, cfg)
+                normalize_roles(doc)
                 if stream and path in OPENAI_STREAMS and not (doc.get("stream_options") or {}).get("include_usage"):
                     doc["stream_options"] = dict(doc.get("stream_options") or {}, include_usage=True)
                     strip_usage = True  # the gateway wants the token counts; the client did not ask for them
@@ -716,6 +839,7 @@ class Handler(BaseHTTPRequestHandler):
         live = Live(path, client_name(self.headers.get("User-Agent")), stream) if wake else None
         if live and isinstance(doc, dict):
             live.effort = doc.get("reasoning_effort") or ({True: "default", False: "disabled"}.get(doc.get("enable_thinking")))
+            live.estimate = estimate_tokens(doc)
         if live:
             RECORDER.begin(live)
             ENGINE.touch()
@@ -734,7 +858,7 @@ class Handler(BaseHTTPRequestHandler):
                     RECORDER.finish(live, 503, cfg, ENGINE.version, error="engine failed to start")
                     live = None
                     return self.send_json(503, {"error": {"message": f"the uzu engine failed to start; see {ROOT}/logs/engine.log"}})
-            status_code, cancelled, error = self.proxy(cfg["engine_port"], body, live, strip_usage)
+            status_code, cancelled, error = self.proxy(cfg["engine_port"], body, live, strip_usage, cfg)
             if live:
                 RECORDER.finish(live, status_code, read_config(), ENGINE.version, error=error, cancelled=cancelled)
                 live = None
@@ -770,8 +894,21 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, {"shared": bool(d), "defaults": d})
         return self.send_json(404, {"error": {"message": f"unknown path {path}"}})
 
-    def proxy(self, port, body, live, strip_usage):
-        """Forward to the engine and stream the reply back. Returns (status, cancelled, error)."""
+    def send_overflow(self, live, cfg):
+        estimate = getattr(live, "estimate", None) if live else None
+        if live:
+            live.overflowed = True
+        RECORDER.overflow(live, cfg["context"], estimate)
+        self.send_json(400, overflow_error(cfg, estimate))
+        return 400, False, "context overflow"
+
+    def proxy(self, port, body, live, strip_usage, cfg):
+        """Forward to the engine and stream the reply back. Returns (status, cancelled, error).
+
+        uzu reports a context overflow as HTTP 200 with an error body, or as an error event right after a stream's
+        first chunk. The gateway answers those with the OpenAI-standard 400 context_length_exceeded instead, which
+        clients act on (Hermes compresses the conversation and retries). A stream's start is held until it is clearly
+        not an overflow: its first real output, any later event, or 2 s, whichever comes first."""
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP}
         headers["Content-Length"] = str(len(body))
         upstream = http.client.HTTPConnection("127.0.0.1", port, timeout=3600)
@@ -783,57 +920,118 @@ class Handler(BaseHTTPRequestHandler):
             # uzu sends even a plain JSON reply chunked, so tell a stream by its type, not by a missing length
             ctype = (resp.getheader("Content-Type") or "").lower()
             streaming = "text/event-stream" in ctype or (resp.getheader("Content-Length") is None and "json" not in ctype)
-            self.send_response(resp.status, resp.reason)
-            for k, v in resp.getheaders():
-                if k.lower() not in HOP_BY_HOP:
-                    self.send_header(k, v)
             if not streaming:
                 data = resp.read()
-                if live:
-                    try:
-                        scan_event(json.loads(data), live)
-                    except ValueError:
-                        pass
+                doc = None
+                try:
+                    doc = json.loads(data)
+                except ValueError:
+                    pass
+                if isinstance(doc, dict) and is_overflow(doc.get("error")):
+                    return self.send_overflow(live, cfg)
+                if live and doc is not None:
+                    scan_event(doc, live)
+                self.send_response(resp.status, resp.reason)
+                for k, v in resp.getheaders():
+                    if k.lower() not in HOP_BY_HOP:
+                        self.send_header(k, v)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
                 return status_code, False, None if status_code < 400 else f"HTTP {status_code}"
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
-            buf, skip_blank = b"", False
-            while True:
-                chunk = resp.read1(65536)
-                if not chunk:
-                    break
-                buf += chunk
-                out = []
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    if skip_blank and line.strip() == b"":
+            gate = threading.Lock()
+            held, committed = [], [False]
+
+            def commit():  # under gate: send the headers and whatever was held back
+                if committed[0]:
+                    return
+                committed[0] = True
+                self.send_response(resp.status, resp.reason)
+                for k, v in resp.getheaders():
+                    if k.lower() not in HOP_BY_HOP:
+                        self.send_header(k, v)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                if held:
+                    data = b"".join(held)
+                    held.clear()
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+                self.wfile.flush()
+
+            def timed_commit():
+                with gate:
+                    try:
+                        commit()
+                    except OSError:
+                        pass
+
+            timer = threading.Timer(2.0, timed_commit)
+            timer.daemon = True
+            timer.start()
+            buf, skip_blank, seen_data = b"", False, 0
+            try:
+                while True:
+                    chunk = resp.read1(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    out, trigger = [], False
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if skip_blank and line.strip() == b"":
+                            skip_blank = False
+                            continue
                         skip_blank = False
-                        continue
-                    skip_blank = False
-                    payload = line[5:].strip() if line.startswith(b"data:") else b""
-                    if payload.startswith(b"{") and live is not None:  # uzu writes "data:{...}", others "data: {...}"
-                        try:
-                            ev = json.loads(payload)
-                        except ValueError:
-                            ev = None
-                        if ev is not None:
-                            scan_event(ev, live)
-                            if strip_usage and ev.get("choices") == [] and "usage" in ev:
-                                skip_blank = True
-                                continue
-                    out.append(line + b"\n")
-                if out:
-                    payload = b"".join(out)
-                    self.wfile.write(b"%x\r\n%s\r\n" % (len(payload), payload))
-                    self.wfile.flush()
-            if buf:
-                self.wfile.write(b"%x\r\n%s\r\n" % (len(buf), buf))
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
-            return status_code, False, None
+                        payload = line[5:].strip() if line.startswith(b"data:") else b""
+                        if payload.startswith(b"{"):  # uzu writes "data:{...}", others "data: {...}"
+                            try:
+                                ev = json.loads(payload)
+                            except ValueError:
+                                ev = None
+                            if isinstance(ev, dict):
+                                if is_overflow(ev.get("error")):
+                                    with gate:
+                                        if not committed[0]:  # nothing reached the client yet: a clean 400
+                                            timer.cancel()
+                                            committed[0] = True
+                                            self.close_connection = True
+                                            result = self.send_overflow(live, cfg)
+                                            return result
+                                    # already streaming: rewrite the event so the client still recognises it
+                                    if live:
+                                        live.overflowed = True
+                                    RECORDER.overflow(live, cfg["context"], getattr(live, "estimate", None))
+                                    line = b"data: " + json.dumps(overflow_error(cfg, getattr(live, "estimate", None))).encode()
+                                elif live is not None:
+                                    scan_event(ev, live)
+                                if strip_usage and ev.get("choices") == [] and "usage" in ev:
+                                    skip_blank = True
+                                    continue
+                                seen_data += 1
+                                delta = ((ev.get("choices") or [{}])[0] or {}).get("delta") or {}
+                                if seen_data > 1 or any(delta.get(k) for k in ("content", "reasoning_content", "tool_calls")):
+                                    trigger = True  # past the first chunk: not an overflow any more
+                        out.append(line + b"\n")
+                    with gate:
+                        if not committed[0]:
+                            held.extend(out)
+                            if trigger:
+                                commit()
+                            continue
+                    if out:
+                        data = b"".join(out)
+                        self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+                        self.wfile.flush()
+                with gate:
+                    timer.cancel()
+                    commit()
+                if buf:
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(buf), buf))
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                return status_code, False, None
+            finally:
+                timer.cancel()
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True  # client went away; closing upstream cancels the generation
             return status_code, True, None
@@ -847,6 +1045,44 @@ class Handler(BaseHTTPRequestHandler):
             upstream.close()
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = handle_any
+
+
+def normalize_roles(doc):
+    """uzu's chat encoding wants a user turn right after the system/developer messages. A client that has compressed
+    its history (Hermes does, near the end of the context) can send one that resumes with the assistant; uzu then
+    refuses it ("Expected one of [developer, user] after 'system', got 'assistant'"). Put a short user turn first."""
+    msgs = doc.get("messages")
+    if not isinstance(msgs, list):
+        return False
+    i = 0
+    while i < len(msgs) and isinstance(msgs[i], dict) and msgs[i].get("role") in ("system", "developer"):
+        i += 1
+    if i < len(msgs) and isinstance(msgs[i], dict) and msgs[i].get("role") in ("assistant", "tool"):
+        msgs.insert(i, {"role": "user", "content": "Continue."})
+        return True
+    return False
+
+
+def estimate_tokens(doc):
+    """A rough prompt size for a request uzu refused (it reports no count): about 3.7 characters a token."""
+    try:
+        text = json.dumps(doc.get("messages", ""), ensure_ascii=False) + json.dumps(doc.get("tools", ""), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+    return int(len(text) / 3.7)
+
+
+def is_overflow(err):
+    msg = (err or {}).get("message", "") if isinstance(err, dict) else str(err or "")
+    return "context overflow" in msg.lower() or "context length" in msg.lower()
+
+
+def overflow_error(cfg, estimate):
+    """The OpenAI-standard error, which clients (Hermes) answer by compressing the conversation and trying again."""
+    about = f" However, your messages resulted in about {estimate:,} tokens." if estimate else ""
+    return {"error": {"message": f"This model's maximum context length is {cfg['context']} tokens.{about} Please reduce the "
+                                 f"length of the messages, or raise the context window in uzu Home (Server > Model).",
+                      "type": "invalid_request_error", "param": "messages", "code": "context_length_exceeded"}}
 
 
 def apply_defaults(doc, path):

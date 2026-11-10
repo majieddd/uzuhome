@@ -20,5 +20,14 @@ for f in "${dir%/}/model.safetensors" "${dir%/}/speculator/model.safetensors"; d
   [[ -f $f ]] && { cat "$f" >/dev/null 2>&1 & }
 done
 
-echo "uzu-engine: $(date '+%F %T') starting $label ($source: $ref) with uzu $(engine_version) on 127.0.0.1:$ENGINE_PORT, context $CONTEXT, $SESSIONS sessions"
+# The M5's matrix units: uzu 0.6.7 and later build their MXU kernels with Metal tensor ops that macOS 26.4 brought;
+# before it those pipelines fail to load ("Undefined symbols: __tensorops_impl_matmul2d..."). MXU=auto (the default)
+# turns them off there and the SIMD kernels run, as on M1-M4; MXU=on or off forces it (uzu Home's patch reads it).
+os=$(sw_vers -productVersion)
+case ${MXU:-auto} in
+  off) export UZU_DISABLE_MXU=1 ;;
+  on) unset UZU_DISABLE_MXU ;;
+  *) if [[ $(printf '%s\n26.4\n' "$os" | sort -V | head -1) != 26.4 ]]; then export UZU_DISABLE_MXU=1; fi ;;
+esac
+echo "uzu-engine: $(date '+%F %T') starting $label ($source: $ref) with uzu $(engine_version) on 127.0.0.1:$ENGINE_PORT, context $CONTEXT, $SESSIONS sessions, matrix units $([[ -n ${UZU_DISABLE_MXU:-} ]] && echo "off (macOS $os)" || echo on)"
 exec "$ENGINE_BIN" server --model "$ref" --host 127.0.0.1 --port "$ENGINE_PORT" --context-length "$CONTEXT" --sessions "$SESSIONS"

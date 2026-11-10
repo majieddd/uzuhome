@@ -11,8 +11,22 @@ TAG=${1:?usage: uzu-build-engine TAG OUT_DIR}
 OUT=${2:?usage: uzu-build-engine TAG OUT_DIR}
 SRC=${UZU_BUILD_SRC:-$ROOT/src/uzu}
 PATCHES=${UZU_PATCHES:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/patches}
+# patches/<uzu version>/ per release line: the folder for TAG, else the newest one older than it
+if [[ ! -d $PATCHES/$TAG ]] && ls -d "$PATCHES"/[0-9]* >/dev/null 2>&1; then
+  pick=""
+  for d in $(ls -d "$PATCHES"/[0-9]* | xargs -n1 basename | sort -V); do
+    [[ $(printf '%s\n%s\n' "$d" "${TAG#v}" | sort -V | tail -1) == "${TAG#v}" ]] && pick=$d
+  done
+  [[ -n $pick ]] && PATCHES=$PATCHES/$pick
+elif [[ -d $PATCHES/$TAG ]]; then
+  PATCHES=$PATCHES/$TAG
+fi
 [[ -f $HOME/.cargo/env ]] && source "$HOME/.cargo/env"
 command -v cargo >/dev/null || { echo "uzu-build-engine: rustup is needed (https://rustup.rs)" >&2; exit 3; }
+# uzu's rust-toolchain.toml asks for nightly plus the standard library of ten targets (iOS, Windows, Linux, wasm...),
+# several GB this Mac-only build never uses. Naming the channel here makes rustup skip that file; the minimal profile
+# installs the compiler, cargo and this Mac's standard library only.
+export RUSTUP_TOOLCHAIN=${UZU_RUST_TOOLCHAIN:-nightly}
 xcrun --find metal >/dev/null 2>&1 || { echo "uzu-build-engine: Xcode's Metal toolchain is needed" >&2; exit 3; }
 
 if [[ ! -d $SRC/.git ]]; then
@@ -22,16 +36,35 @@ fi
 git -C "$SRC" fetch --quiet --tags --force origin
 git -C "$SRC" checkout --quiet --force "refs/tags/$TAG"
 git -C "$SRC" clean --quiet -fd crates
+# Each patch: applied as is; skipped when uzu already has it (upstream took the change); else a three-way merge,
+# which absorbs code that moved; only a real conflict stops the build.
 for p in "$PATCHES"/*.patch; do
   [[ -f $p ]] || continue
-  git -C "$SRC" apply --check "$p" || { echo "uzu-build-engine: $(basename "$p") does not apply to uzu $TAG" >&2; exit 4; }
-  git -C "$SRC" apply "$p"
+  name=$(basename "$p")
+  if git -C "$SRC" apply --check "$p" 2>/dev/null; then
+    git -C "$SRC" apply "$p"
+  elif git -C "$SRC" apply --reverse --check "$p" 2>/dev/null; then
+    echo "uzu-build-engine: $name is already in uzu $TAG; skipped"
+  elif git -C "$SRC" apply --3way "$p" >/dev/null 2>&1 && [[ -z $(git -C "$SRC" diff --name-only --diff-filter=U) ]]; then
+    echo "uzu-build-engine: $name applied to uzu $TAG with a three-way merge"
+  else
+    git -C "$SRC" reset --quiet --hard && git -C "$SRC" clean --quiet -fd crates
+    echo "uzu-build-engine: $name does not apply to uzu $TAG (uzu changed the code it edits; uzu Home needs an update)" >&2
+    exit 4
+  fi
 done
-(cd "$SRC" && cargo build --release --locked -p cli)
+rustup toolchain list | grep -q "^$RUSTUP_TOOLCHAIN" || rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+if ! (cd "$SRC" && cargo build --release --locked -p cli); then
+  # a newer uzu can need a newer nightly than the one installed: update it (minimal profile) and try once more
+  echo "uzu-build-engine: retrying with an updated $RUSTUP_TOOLCHAIN toolchain"
+  rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+  (cd "$SRC" && cargo build --release --locked -p cli)
+fi
 mkdir -p "$OUT"
 cp "$SRC/target/release/cli" "$OUT/uzu"
 codesign --force --sign - "$OUT/uzu" 2>/dev/null
 "$OUT/uzu" server --help | grep -q -- --context-length && "$OUT/uzu" server --help | grep -q -- --sessions ||
   { echo "uzu-build-engine: the build lacks --context-length or --sessions" >&2; exit 5; }
 printf '%s+%s.p%s\n' "$TAG" "$(git -C "$SRC" rev-parse --short HEAD)" "$(cat "$PATCHES"/*.patch | shasum -a 256 | cut -c1-6)" >"$OUT/VERSION"
+git -C "$SRC" reset --quiet --hard && git -C "$SRC" clean --quiet -fd crates  # leave the checkout as the tag
 echo "uzu-build-engine: built uzu $(cat "$OUT/VERSION") in $OUT"

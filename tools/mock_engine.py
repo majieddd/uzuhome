@@ -8,7 +8,9 @@ Every request body is written to RECORD_DIR/last_<path>.json. Like uzu it answer
 /v1/chat/completions only, writes stream events as "data:{...}" (no space), puts usage (with spec_verify_ct, the
 speculator's steps) on the finishing chunk, and refuses an unknown reasoning_effort or one that contradicts
 enable_thinking with a 400. The first token comes 0.2 s after the request (the "prefill"); a prompt containing "SLOW"
-then streams one token every 0.2 s.
+then streams one token every 0.2 s. Like uzu, a stream opens with a role-only chunk; a user or developer turn must follow
+the system messages (else HTTP 200 with an error body); "OVERFLOW" in the prompt gets uzu's "Context overflow" (an
+error body, or an error event after the first chunk), and "PREFILL5" makes the first token wait 5 s.
 """
 import json
 import os
@@ -41,6 +43,14 @@ class H(BaseHTTPRequestHandler):
             return self.send_json(200, {"object": "list", "data": [{"id": "mock", "object": "model", "created": 0, "owned_by": "uzu"}]})
         return self.send_json(404, {"error": {"message": "not found"}})
 
+    def send_chunked_json(self, obj):  # uzu answers refusals with HTTP 200 and an error body, chunked
+        data = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        self.wfile.write(b"%x\r\n%s\r\n0\r\n\r\n" % (len(data), data))
+
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
         name = self.path.strip("/").replace("/", "_")
@@ -54,6 +64,18 @@ class H(BaseHTTPRequestHandler):
             return self.send_json(400, {"error": {"message": f"Unknown reasoning effort: {effort}", "param": "reasoning_effort"}})
         if effort is not None and enable is not None and (effort == "disabled") == enable:
             return self.send_json(400, {"error": {"message": f"reasoning_effort {effort} conflicts with enable_thinking {enable}"}})
+        msgs = body.get("messages") or []
+        roles = [m.get("role") for m in msgs if isinstance(m, dict)]
+        i = 0
+        while i < len(roles) and roles[i] in ("system", "developer"):
+            i += 1
+        if 0 < i < len(roles) and roles[i] not in ("user", "developer"):
+            return self.send_chunked_json({"error": {"message": f"Expected one of [developer, user] after '{roles[i - 1]}', got '{roles[i]}'",
+                                                     "type": "invalid_request_error", "param": None, "code": "backend_error"}})
+        overflow = "OVERFLOW" in json.dumps(msgs)
+        if overflow and not body.get("stream"):
+            return self.send_chunked_json({"error": {"message": "Context overflow", "type": "invalid_request_error",
+                                                     "param": None, "code": "backend_error"}})
         slow = "SLOW" in json.dumps(body.get("messages", ""))
         n_prompt = 40
         words = WORDS * (25 if slow else 1)
@@ -82,6 +104,16 @@ class H(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         try:
+            self.wfile.write(b"2\r\n:\n\r\n")  # uzu's keep-alive comment
+            emit({"id": "c1", "object": "chat.completion.chunk", "created": 0, "model": "mock",
+                  "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+            if overflow:
+                emit({"error": {"message": "Context overflow", "type": "invalid_request_error", "param": None, "code": "backend_error"}})
+                emit(b"[DONE]")
+                self.wfile.write(b"0\r\n\r\n")
+                return
+            if "PREFILL5" in json.dumps(msgs):
+                time.sleep(5)
             for w in words:
                 emit({"id": "c1", "object": "chat.completion.chunk", "created": 0, "model": "mock",
                       "choices": [{"index": 0, "delta": {"content": w}, "finish_reason": None}]})

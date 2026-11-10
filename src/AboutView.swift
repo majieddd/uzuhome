@@ -151,28 +151,14 @@ private struct SettingsCard: View {
 private struct ModelSettingsCard: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.pal) var pal
-    @State private var pick = 0
-    static let sizes = [16384, 32768, 65536, 131072, 262144]
 
     var body: some View {
-        let now = model.context
-        let sizes = (Self.sizes.contains(now) ? Self.sizes : (Self.sizes + [now]).sorted())
-        TitledCard(title: "Model settings", trailing: "now \(Fmt.k(Double(now))) tokens",
+        TitledCard(title: "Model settings", trailing: "now \(ContextSize.label(model.context)) tokens",
                    note: "What uzu runs the model with. They are kept in config.env, so uzuctl, the menu bar and Hermes see the same values.") {
-            Text("Context length").outfit(13, .medium).foregroundStyle(pal.inkSoft).padding(.top, 16)
-            Muted(text: "How much one conversation can hold, prompt plus reply. A longer context keeps more of a long chat or a big file in view and reserves more memory up front: a 9B Qwen3.5 with its speculator takes about 8.4 GB at 32K and 10 GB at 64K.")
-                .padding(.top, 4).padding(.bottom, 10)
-            Segmented(options: sizes.map { ($0, Fmt.k(Double($0))) }, selection: $pick, fill: false)
-            Muted(text: hint(pick, now)).padding(.top, 10)
-            HStack(spacing: 10) {
-                Button("Save and restart") { model.setContext(pick, restart: true) }.buttonStyle(PrimaryButtonStyle())
-                Button("Save for next start") { model.setContext(pick, restart: false) }.buttonStyle(SecondaryButtonStyle())
-            }
-            .disabled(pick == now || pick == 0)
-            .padding(.top, 14)
+            ContextWindowEditor(showTitle: false).padding(.top, 14)
             Rectangle().fill(pal.lineSoft).frame(height: 1).padding(.vertical, 18)
             ToggleRow(title: "Keep a second conversation",
-                      sub: "uzu keeps what it has read of the conversation it is in. With a second one, a short side request (Hermes's chat titles) goes there, so the next turn of a long conversation doesn't read its whole prompt again (about 35 s for Hermes). Costs about 3 GB more at 64K (a 9B model takes about 13 GB instead of 10). Restarts the model.",
+                      sub: "uzu keeps what it has read of the conversation it is in. With a second one, a short side request (Hermes's chat titles) goes there, so the next turn of a long conversation doesn't read its whole prompt again (about 35 s for Hermes). It doubles the memory the context window takes (the estimate above counts it). Restarts the model.",
                       isOn: Binding(get: { model.sessions >= 2 }, set: { model.setSessions($0 ? 2 : 1) }))
                 .padding(.top, -16)
             ToggleRow(title: "Think by default",
@@ -180,16 +166,5 @@ private struct ModelSettingsCard: View {
                       isOn: Binding(get: { model.thinkingDefault }, set: { model.setThinkingDefault($0) }))
                 .padding(.top, -16)
         }
-        .onAppear { pick = now }
-        .onChange(of: now) { _, v in pick = v }
-    }
-
-    func hint(_ n: Int, _ now: Int) -> String {
-        guard n > 0 else { return "" }
-        var t = "\(Fmt.n(Double(n))) tokens"
-        if n < 64000 { t += ". Hermes refuses endpoints under 64,000 tokens" }
-        if n > 131072 { t += ". Long contexts need more memory; if the model fails to load, pick a smaller size" }
-        if n != now { t += ". Changes from \(Fmt.k(Double(now)))" }
-        return t + "."
     }
 }

@@ -1,0 +1,77 @@
+diff --git a/crates/legacy/cli/src/main.rs b/crates/legacy/cli/src/main.rs
+index 99a73219..2b2c7449 100644
+--- a/crates/legacy/cli/src/main.rs
++++ b/crates/legacy/cli/src/main.rs
+@@ -61,6 +61,10 @@ enum Commands {
+         /// Print verbose information into the file log
+         #[arg(long)]
+         verbose_file_log: bool,
++        /// Context window in tokens. Defaults to the model's recommended length, which is 16384 on GPUs
++        /// without sparse buffers.
++        #[arg(long, value_name = "TOKENS")]
++        context_length: Option<u32>,
+     },
+     Storage {
+         #[arg(long, value_enum, default_value_t = storage::DownloadManagerCliType::default())]
+@@ -89,7 +93,11 @@ async fn main() -> Result<()> {
+             prefix_cache,
+             no_prefix_cache,
+             verbose_file_log,
+-        }) => server::run_server(model, host, port, prefix_cache || !no_prefix_cache, verbose_file_log).await?,
++            context_length,
++        }) => {
++            server::run_server(model, host, port, prefix_cache || !no_prefix_cache, verbose_file_log, context_length)
++                .await?
++        },
+         Some(Commands::Storage {
+             download_manager,
+         }) => storage::run(download_manager).await?,
+diff --git a/crates/legacy/cli/src/server/runner.rs b/crates/legacy/cli/src/server/runner.rs
+index ff374c78..af008631 100644
+--- a/crates/legacy/cli/src/server/runner.rs
++++ b/crates/legacy/cli/src/server/runner.rs
+@@ -6,7 +6,7 @@ use rocket::{Config, config::LogLevel, routes};
+ use tokio::sync::Mutex;
+ use uzu::{
+     engine::{Engine, EngineConfig},
+-    types::{model::ModelSpecialization, session::chat::ChatConfig},
++    types::{basic::ContextLength, model::ModelSpecialization, session::chat::ChatConfig},
+ };
+ 
+ use crate::{
+@@ -24,6 +24,7 @@ pub async fn run_server(
+     port: u16,
+     prefix_cache: bool,
+     verbose_file_logs: bool,
++    context_length: Option<u32>,
+ ) -> Result<()> {
+     let file_logger = if verbose_file_logs {
+         let cache_dir = std::env::var_os("XDG_CACHE_HOME")
+@@ -85,7 +86,13 @@ pub async fn run_server(
+         (rocket, "System One server", details.to_string())
+     } else {
+         let thinking_support = ThinkingSupport::for_model(&resolved);
+-        let session = engine.chat(resolved, ChatConfig::default()).await.context("Failed to create chat session")?;
++        let chat_config = match context_length {
++            Some(length) => ChatConfig::default().with_context_length(ContextLength::Custom {
++                length: i64::from(length),
++            }),
++            None => ChatConfig::default(),
++        };
++        let session = engine.chat(resolved, chat_config).await.context("Failed to create chat session")?;
+         let state = ChatState {
+             session: Arc::new(Mutex::new(session)),
+             thinking_support,
+@@ -103,10 +110,12 @@ pub async fn run_server(
+         let details = format!(
+             concat!(
+                 "🗄️  Prefix cache: {prefix_cache_enabled}\n",
++                "📏 Context: {context}\n",
+                 "📝 Endpoints:\n",
+                 "   POST /v1/chat/completions (or /chat/completions)\n",
+             ),
+             prefix_cache_enabled = prefix_cache_enabled,
++            context = context_length.map_or_else(|| "model default".to_string(), |length| format!("{length} tokens")),
+         );
+         (rocket, "OpenAI-compatible server", details)
+     };

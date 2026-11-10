@@ -42,7 +42,7 @@ if [[ -x engine/uzu ]]; then
 fi
 find "$B" -name __pycache__ -prune -exec rm -rf {} +
 # the app reinstalls its backend scripts when this stamp differs from the installed one
-echo "$VERSION+$( (cd backend && cat bin/* lib/* patches/*; find share -type f -exec cat {} +) | shasum -a 256 | cut -c1-12)" >"$B/VERSION"
+echo "$VERSION+$( (cd backend && cat bin/* lib/*; find patches share -type f | sort | xargs cat) | shasum -a 256 | cut -c1-12)" >"$B/VERSION"
 
 cat >"$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

@@ -17,8 +17,8 @@ controls, with engine and app updates and a menu-bar item. You don't need a brow
 |---|---|
 | **Chat** | Streaming answers with Markdown (headings, lists, tables, code blocks with a copy button). A collapsible "Thought for 2.1 s" block shows the model's reasoning. Each answer shows tokens, tok/s and the speculator's tokens per step. You can attach a text file (or drop one), start a New chat with Undo, and save the chat as Markdown. The **Sampling** drawer sets thinking, temperature, top-p, top-k, max tokens and seed, and can share them with other apps. The conversation stays on this Mac. |
 | **Monitor** | Live meters, refreshed every second. Model state (idle, loading, reading the prompt, generating, queued, error), decode and prefill speed, GPU load, unified memory and memory pressure, the engine's own memory, **tokens per step**, thermal state, CPU, disk. Below them: context fill, recent requests from every client (Hermes, this app, scripts), the prompt cache, and **performance by uzu version**. |
-| **About** | The loaded model (Mirai catalog id or folder, size, speculator) and engine, this Mac's chip, GPU, cores, memory and Metal's GPU memory limit. **Connect your tools** has a copy-ready OpenAI base URL and a ready-made Hermes config. Also the theme, the context length, a second conversation for side requests, and whether the model thinks by default. |
-| **Server** | **Start**, **Stop**, **Restart**, **Free memory** and **Copy API URL**. Pick the model, add one **from Mirai's catalog**, or **convert a Qwen3.5 MLX build from Hugging Face**. Choose the memory mode: keep the model loaded, unload it when idle after N minutes, or load it on the first request. **Serve the model on the network** with an optional **API key**. Options, **uzu engine updates**, **uzu Home updates**, and the engine, endpoint, update, conversion and app logs. |
+| **About** | The loaded model (Mirai catalog id or folder, size, speculator) and engine, this Mac's chip, GPU, cores, memory and Metal's GPU memory limit. **Connect your tools** has a copy-ready OpenAI base URL and a ready-made Hermes config. Also the theme, the context window, a second conversation for side requests, and whether the model thinks by default. |
+| **Server** | **Start**, **Stop**, **Restart**, **Free memory** and **Copy API URL**. Pick the model, add one **from Mirai's catalog**, or **convert a Qwen3.5 MLX build from Hugging Face**. Set the **context window** (presets or any size, with a memory estimate). Choose the memory mode: keep the model loaded, unload it when idle after N minutes, or load it on the first request. **Serve the model on the network** with an optional **API key**. Options, **uzu engine updates**, **uzu Home updates**, and the engine, endpoint, update, conversion and app logs. |
 
 |  |  |
 |---|---|
@@ -124,24 +124,51 @@ TensorFold on the same weights. With it, greedy output can differ slightly in wo
 several tokens in one step, and the arithmetic of that step differs a little from one token at a time); without it,
 output is byte-for-byte repeatable.
 
-Memory, with the speculator: a 9B model takes about 10 GB at 64K context (8.4 GB at 32K), and a second conversation
-adds about 3 GB at 64K. uzu sets the context aside up front on GPUs without sparse buffers, the M5 included.
+Memory, with the speculator, on uzu 0.6.3: a 9B model takes about 10 GB at 64K context (8.4 GB at 32K), and a second
+conversation adds about 3 GB at 64K. That uzu sets the whole window aside when the model loads. uzu 0.6.17 takes the
+memory as a conversation fills instead (8.1 GB loaded at 128K, 12 GB once a 70K-token prompt was read).
+
+## Context window
+
+**Server > Model > Context window** (also on the About page and in the menu-bar menu) sets how much one conversation
+can hold. Pick a preset, which goes up to what the model was built for (256K for most Qwen3.5 9B builds, 1M for
+Qwythos), or type any size (`96K`, `100000`, `1M`). Under it the app shows the memory that size takes, worked out from
+the model's own layers (56 KB a token for a 9B Qwen3.5 with its speculator) and the loaded model's measured size,
+against the GPU memory macOS allows this Mac (17.8 GB on a 24 GB M5), and warns before a size that won't fit.
+
+**Apply** reloads the model at the new size and watches it come up. If it doesn't load, usually because it is too big
+for memory, the previous size comes back and is reloaded, with the engine's error in the message. Hermes reads the new
+size from the endpoint by itself.
+
+When a request is longer than the window, the endpoint answers with the standard `context_length_exceeded` error (uzu
+itself reports it as a generic error with HTTP 200), which tells Hermes to compress the conversation and try again. The
+endpoint counts these, and the context window card says how many requests didn't fit, how big the largest was, and
+offers the size that would have held it.
 
 ## The engine and its patches
 
-uzu Home ships uzu's CLI (`uzu server`) built from a uzu release with three small patches in `backend/patches`:
+uzu Home ships uzu's CLI (`uzu server`) built from a uzu release with small patches, one folder per uzu release line
+in `backend/patches` (`0.6.3/`, `0.6.17/`):
 
 | Patch | Why |
 |---|---|
 | `uzu-server-context-length` | adds `--context-length`. Without it, uzu caps the context at 16,384 tokens on GPUs without sparse buffers (the M5 included), and Hermes needs 64,000. |
-| `uzu-grammar-trigger` | makes structured output (`response_format`) work with Qwen-style thinking models. The grammar waits for the end-of-thinking tag, and uzu looked for it as `\n</think>`, which never appears that way once tokenized (`\n\n` is one token), so JSON-schema requests came back as plain text. |
+| `uzu-grammar-trigger` | makes structured output (`response_format`) work with Qwen-style thinking models: the grammar waits for the end-of-thinking tag, and with the whitespace around it the tag is never matched once tokenized. uzu 0.6.17 strips the leading whitespace itself; the trailing whitespace still holds the grammar back (a Hermes-style title request, greedy: no answer in 2,000 tokens without the patch, valid JSON in 1,517 with it). |
 | `uzu-server-sessions` | adds `--sessions N`: several conversations on one loaded model, each request going to the one it continues. |
+| `uzu-metal-mxu-switch` (0.6.17) | lets `UZU_DISABLE_MXU=1` keep the M5's matrix units out. uzu 0.6.17 builds those kernels on Metal tensor ops that came with macOS 26.4; before it they fail to load ("Undefined symbols: __tensorops_impl_matmul2d…"). The engine launcher sets it on macOS before 26.4 (`MXU=auto` in config.env; `on`/`off` force it). |
 
-Mirai's own ready-made CLI is built for macOS 26.4 and has none of these options, so the release builds uzu from
-source (`tools/build-engine.sh`). The daily engine check installs a new uzu release from Mirai's build when it runs on
-this macOS and has the options, builds it from source with the patches when Rust and Xcode's Metal toolchain are here,
-and otherwise waits for the next uzu Home release. A new engine has to start before it is kept; the one it replaced is
-kept in `engine/previous` and comes back if it doesn't.
+**Which uzu runs on which macOS.** The app bundles uzu 0.6.3. uzu 0.6.17 needs macOS 26.4 to run well on an M5: on
+macOS 26.2, with the matrix units off, it reads prompts at 178 tokens a second against 700-800 for 0.6.3, so there the
+engine check reports it as available and waits for macOS 26.4. On 26.4 it installs it.
+
+The daily engine check, and **Check now / Update now** on the Server tab, install a newer uzu release from, in this
+order: uzu Home's own ready-made engine (`uzu-engine-<version>-macos-arm64.tar.gz`, attached to a uzu Home release and
+built with the patches); Mirai's build, when it runs on this macOS and has the options; a source build with the patches
+when Rust and Xcode's Metal toolchain are here (`tools/build-engine.sh` asks rustup for this Mac's target only, not the
+ten that uzu's `rust-toolchain.toml` lists). Downloads are checked against the SHA-256 GitHub publishes. A new engine
+has to load the model, not only start, before it is kept: with the model unloaded the check loads it once and unloads
+it. The engine it replaced is kept in `engine/previous` and comes back if the new one fails. A GitHub check that fails
+(a Mac that just woke for the 04:30 run may not be online yet) is tried three times, then read from git.
 
 ## What else it does
 
@@ -149,6 +176,7 @@ kept in `engine/previous` and comes back if it doesn't.
 |---|---|
 | **Memory modes** | Keep the model loaded, unload it after N idle minutes (default 30), or load it only on the first request. The endpoint stays up either way. A cached 9B model loads in about 2 s; one that has to come from disk takes longer. |
 | **Serving on the network** | Off by default. On, the endpoint listens on `0.0.0.0`, and other computers reach it at the address shown (e.g. `http://192.168.1.15:8585/v1`). **Require an API key** is a second, optional switch: **Generate** writes a random key; other computers send it as `Authorization: Bearer <key>` or `x-api-key`. Requests from this Mac never need it. If macOS asks whether Python may accept incoming connections, allow it. |
+| **Requests Hermes compresses** | Near the end of the context Hermes compresses a conversation, and the shortened history can go on with the assistant right after the system prompt, which uzu refuses ("Expected one of [developer, user] after 'system', got 'assistant'"). The endpoint puts a short user turn there. |
 | **Shared sampling** | "Use for other apps too" in the Sampling drawer fills those settings into any request that leaves them out, so Hermes gets the same thinking level and temperature. |
 | **uzu Home updates** | Checks this repository's releases on startup and every six hours. **Update** downloads `UzuHome.zip` and checks its SHA-256 against the digest GitHub publishes for that asset. A download that doesn't match, or a release with no digest, is refused. The verified app goes in when you quit, and the version you had is kept in `updates/app-before-<version>`. |
 | **Performance by uzu version** | Prefill and decode averages per uzu version and model, weighted by tokens, newest first, with the running version compared to the one before. |
@@ -182,8 +210,8 @@ scripts it installs are in `backend/`, and `tools/make_icon.swift` draws the ico
 "dist/uzu Home.app/Contents/MacOS/UzuHome" --selftest
 ```
 
-This runs 35 checks: Markdown parsing, version comparison, the SHA-256 gate on an app update, config.env and
-models.conf edits, converted-model folders, catalog ids and Hugging Face names, how attachments are fenced, the run
+This runs 42 checks: Markdown parsing, version comparison, the SHA-256 gate on an app update, config.env and
+models.conf edits, context sizes (parsing "96K", the presets, the suggested size and the memory estimate), converted-model folders, catalog ids and Hugging Face names, how attachments are fenced, the run
 states and the status pill, and this Mac's meters. If an endpoint is running, it also reads its status (it doesn't
 send requests). Results go to `~/Library/Application Support/UzuHome/logs/selftest.txt`; exit code 0 means everything
 passed.
@@ -192,11 +220,12 @@ passed.
 python3 -m unittest discover -s tools -p test_gateway.py -v
 ```
 
-runs 13 tests of the endpoint against a mock of uzu's server on spare ports, with no model and no GPU: `/v1/models`,
+runs 17 tests of the endpoint against a mock of uzu's server on spare ports, with no model and no GPU: `/v1/models`,
 "a probe doesn't wake the model", wake on demand and model-name rewriting, chunked JSON and streamed replies, a clear
 404 for other APIs, the default thinking mode and `reasoning_effort` names, shared sampling, the per-request stats,
 totals, history and per-version performance log, live state and client disconnects, concurrent requests, idle unload
-and "keep loaded", and the API key on the network.
+and "keep loaded", the API key on the network, a history that starts with an assistant turn, an over-long prompt
+answered with `context_length_exceeded` (plain and streamed) and counted, and headers sent early for a slow prefill.
 
 `--update-check` runs the real uzu Home release check and writes `logs/update-check.txt`; `--update-download` also
 downloads the release's zip and verifies its SHA-256, app identity and version, staging nothing. Other flags:

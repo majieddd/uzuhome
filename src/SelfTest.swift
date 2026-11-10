@@ -61,6 +61,23 @@ enum SelfTest {
         if case .code(let lang, let text) = Markdown.parse("Here:\n```py\nprint(1)\nprint(2)").last {
             check("an unclosed fence (still streaming) is code", lang == "py" && text == "print(1)\nprint(2)")
         } else { check("an unclosed fence is code", false) }
+
+        // context window: what can be typed, the presets a model offers, the suggestion after an overflow, the estimate
+        check("context sizes read as typed", ContextSize.parse("128K") == 131_072 && ContextSize.parse("100,000") == 100_000
+              && ContextSize.parse("1M") == 1_048_576 && ContextSize.parse(" 96 k ") == 98_304 && ContextSize.parse("abc") == nil
+              && ContextSize.parse("0") == nil)
+        check("context labels", ContextSize.label(65536) == "64K" && ContextSize.label(1_048_576) == "1M" && ContextSize.label(100_000) == "100,000",
+              [65536, 1_048_576, 100_000].map(ContextSize.label).joined(separator: " "))
+        check("presets stop at the model's limit and keep the current size",
+              ContextSize.options(now: 100_000, max: 262_144) == [16384, 32768, 65536, 100_000, 131_072, 262_144])
+        check("an overflow suggests a size with room to spare",
+              ContextSize.suggestion(for: 78_000, max: 1_048_576) == 131_072 && ContextSize.suggestion(for: 300_000, max: 262_144) == nil)
+        // a 9B Qwen3.5 with Mirai's speculator: 4.7 GB + 0.7 GB of weights, 56 KB a token; measured 10 GB at 64K, 13 GB with two
+        let e = ContextEstimate(bytes: 5.42e9 + 1.1e9 + 57_344 * 65536, budget: 19.07e9)
+        check("memory estimate (9B at 64K, one conversation) is about 10 GB", abs(e.bytes / 1e9 - 10.3) < 0.3 && e.fit == .comfortable,
+              Fmt.n(e.bytes / 1e9, 1) + " GB")
+        let big = ContextEstimate(bytes: 5.42e9 + 1.1e9 + 57_344 * 131_072 * 2, budget: 19.07e9)
+        check("128K with two conversations is flagged as too big for a 24 GB Mac", big.fit == .tooBig, Fmt.n(big.bytes / 1e9, 1) + " GB")
         check("plain text is one paragraph", Markdown.parse("line one\nline two") == [.paragraph("line one\nline two")])
 
         // versions

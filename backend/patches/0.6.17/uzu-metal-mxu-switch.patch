@@ -1,0 +1,15 @@
+diff --git a/crates/uzu-engine/src/backends/metal/context.rs b/crates/uzu-engine/src/backends/metal/context.rs
+index e04858e7..f490b96e 100644
+--- a/crates/uzu-engine/src/backends/metal/context.rs
++++ b/crates/uzu-engine/src/backends/metal/context.rs
+@@ -123,7 +123,9 @@ impl Context for MetalContext {
+ 
+         let device_name = device.name();
+         let gpu_core_count = device.gpu_core_count();
+-        let supports_mxu = device.supports_mxu();
++        // UZU_DISABLE_MXU=1 keeps the M5's matrix units (MXU) out: their kernels link Metal tensor ops that macOS 26.2
++        // and earlier lack (e.g. matmul2d u8 x u8 -> i32), so pipelines fail to build there. The SIMD kernels run anywhere.
++        let supports_mxu = device.supports_mxu() && std::env::var_os("UZU_DISABLE_MXU").is_none_or(|value| value == "0");
+ 
+         let peak_memory_usage = Arc::new(AtomicUsize::new(0));
+ 

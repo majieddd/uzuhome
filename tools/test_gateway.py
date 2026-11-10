@@ -319,6 +319,53 @@ esac
             type(self).write_config()
             type(self).start_gateway()
 
+    def test_13_history_resuming_with_the_assistant_is_accepted(self):
+        msgs = [{"role": "system", "content": "be terse"}, {"role": "assistant", "content": "earlier reply"},
+                {"role": "user", "content": "hi"}]
+        code, reply = self.post("/v1/chat/completions", self.chat(messages=msgs))
+        self.assertEqual(code, 200)
+        self.assertIn("choices", reply)
+        seen = self.engine_saw()["messages"]
+        self.assertEqual([m["role"] for m in seen], ["system", "user", "assistant", "user"])
+        self.assertEqual(seen[1]["content"], "Continue.")
+
+    def test_14_overflow_becomes_context_length_exceeded(self):
+        before = self.get("/uzu/status")[1]["overflows"].get("count", 0)
+        code, reply = self.post("/v1/chat/completions", self.chat(messages=[{"role": "user", "content": "OVERFLOW " * 50}]))
+        self.assertEqual(code, 400)
+        self.assertEqual(reply["error"]["code"], "context_length_exceeded")
+        self.assertIn("maximum context length is 65536 tokens", reply["error"]["message"])
+        status = self.get("/uzu/status")[1]
+        self.assertEqual(status["overflows"]["count"], before + 1)
+        self.assertGreater(status["overflows"]["last_estimate"], 0)
+        self.assertEqual(self.metrics()["requests"][0]["finish"], "overflow")
+
+    def test_15_stream_overflow_is_a_clean_400(self):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.gw_port}/v1/chat/completions",
+                                     data=json.dumps(self.chat(stream=True, messages=[{"role": "user", "content": "OVERFLOW"}])).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=30)
+        self.assertEqual(ctx.exception.code, 400)
+        body = json.loads(ctx.exception.read())
+        ctx.exception.close()
+        self.assertEqual(body["error"]["code"], "context_length_exceeded")
+
+    def test_16_slow_prefill_is_not_held_back(self):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.gw_port, timeout=30)
+        t0 = time.time()
+        conn.request("POST", "/v1/chat/completions", body=json.dumps(self.chat(stream=True, messages=[{"role": "user", "content": "PREFILL5"}])),
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        headers_after = time.time() - t0
+        data = resp.read().decode()
+        conn.close()
+        self.assertEqual(resp.status, 200)
+        self.assertLess(headers_after, 3.5, "the stream starts after the 2 s hold, not after the 5 s prefill")
+        self.assertIn('"role": "assistant"', data.replace('"role":"assistant"', '"role": "assistant"'))
+        self.assertIn("Hello", data)
+        self.assertIn("[DONE]", data)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

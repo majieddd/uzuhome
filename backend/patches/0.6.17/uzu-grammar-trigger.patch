@@ -1,0 +1,17 @@
+diff --git a/crates/legacy/uzu/src/engine/bridge/helpers.rs b/crates/legacy/uzu/src/engine/bridge/helpers.rs
+index a4d7a5f9..809364b8 100644
+--- a/crates/legacy/uzu/src/engine/bridge/helpers.rs
++++ b/crates/legacy/uzu/src/engine/bridge/helpers.rs
+@@ -56,8 +56,10 @@ pub fn grammar_trigger_token_sequence(
+     end_of_thinking_tag: Option<&str>,
+     tokenizer: &Tokenizer,
+ ) -> Option<Vec<u64>> {
+-    let tag = end_of_thinking_tag?;
+-    if tag.trim().is_empty() {
++    // The tag alone: whitespace around it ("</think>\n\n") tokenizes differently in the stream than in isolation, so a
++    // trigger that keeps it can stay unmatched and the grammar never engages (uzu Home: Qwen3.5 conversions via lalamo).
++    let tag = end_of_thinking_tag?.trim();
++    if tag.is_empty() {
+         return None;
+     }
+ 

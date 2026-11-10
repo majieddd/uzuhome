@@ -3,15 +3,17 @@
 #   uzu-update            update now
 #   uzu-update --check    only report whether a newer uzu release exists and how it would be installed
 #   uzu-update --auto     scheduled run (launchd): quiet unless something changed or failed
-# A newer uzu release is installed from Mirai's ready-made build when it runs on this macOS and has the server's
-# --context-length and --sessions options; otherwise it is built from source with uzu Home's patch when rustup and Xcode's Metal
-# toolchain are here; otherwise the next uzu Home release brings it. The engine it replaces is kept as engine/previous
-# and put back if the new one does not start.
+# A newer uzu release is installed, in this order, from: uzu Home's own ready-made engine (a release asset of uzu Home,
+# built with its patches); Mirai's build when it runs on this macOS and has the server's --context-length and --sessions
+# options; a source build with uzu Home's patches when rustup and Xcode's Metal toolchain are here. Otherwise the next uzu
+# Home release brings it. Downloads are checked against the SHA-256 GitHub publishes. The engine it replaces is kept as
+# engine/previous and put back if the new one does not start.
 set -uo pipefail
 source "$(dirname "$(readlink -f "$0")")/uzu-common.sh"
 load_config
 mode=${1:-now}
 API=${UZU_RELEASES_API:-https://api.github.com/repos/trymirai/uzu/releases/latest}
+HOME_API=${UZU_HOME_RELEASES_API:-https://api.github.com/repos/majieddd/uzuhome/releases?per_page=15}
 ASSET=mirai-aarch64-apple-darwin.tar.gz
 WORK="$STATE/engine-update"
 results=() # "component|before|after|status"
@@ -46,12 +48,39 @@ runs_here() { # the binary's minimum macOS is not newer than this Mac's
   [[ -n $minos ]] && ! version_gt "$minos" "$os"
 }
 
+# uzu 0.6.17 runs its M5 kernels on Metal tensor ops that came with macOS 26.4. Before 26.4 uzu Home turns those
+# kernels off (MXU=auto), and then 0.6.17 reads prompts about 4x slower than 0.6.3 did (measured on an M5 with macOS
+# 26.2: 178 against 700-800 tokens a second). So on an older macOS the update waits for macOS 26.4.
+NEEDS_MACOS_FROM=0.6.17
+NEEDS_MACOS=26.4
+held_for_macos() { # held_for_macos TAG -> 0 when TAG should wait for a newer macOS here
+  [[ ${UZU_UPDATE_IGNORE_MACOS:-0} == 1 ]] && return 1
+  ! version_gt "$NEEDS_MACOS_FROM" "${1#v}" && version_gt "$NEEDS_MACOS" "$(sw_vers -productVersion)"
+}
+
 can_build() { { [[ -x $HOME/.cargo/bin/cargo ]] || command -v cargo >/dev/null; } && xcrun --find metal >/dev/null 2>&1; }
+
+github() { # github URL -> the JSON, tried three times (a Mac that just woke for the 04:30 run may not be online yet)
+  local i out
+  for i in 1 2 3; do
+    out=$(/usr/bin/curl -fsS --max-time 20 -H 'Accept: application/vnd.github+json' "$1" 2>/dev/null) && { printf '%s' "$out"; return 0; }
+    ((i < 3)) && sleep $((i * 20))
+  done
+  return 1
+}
+
+download_verified() { # download_verified URL SHA256 FILE
+  /usr/bin/curl -fsSL --max-time 600 -o "$3" "$1" 2>/dev/null && [[ $(shasum -a 256 "$3" | cut -d' ' -f1) == "$2" ]]
+}
 
 before=$(engine_version)
 before_tag=${before%%+*}
-release=$(/usr/bin/curl -fsS --max-time 20 -H 'Accept: application/vnd.github+json' "$API" 2>/dev/null)
+release=$(github "$API")
 latest=$(printf '%s' "$release" | py 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null)
+if [[ -z $latest ]]; then # the API refused or rate-limited: the newest release tag straight from git
+  latest=$(git ls-remote --tags --refs https://github.com/trymirai/uzu.git 2>/dev/null | awk -F/ '{print $3}' |
+    grep -E '^v?[0-9]+(\.[0-9]+)+$' | sort -V | tail -1)
+fi
 
 install_candidate() { # install_candidate BINARY VERSION HOW
   mkdir -p "$ROOT/engine/previous"
@@ -60,6 +89,22 @@ install_candidate() { # install_candidate BINARY VERSION HOW
   cp "$1" "$ENGINE_BIN.new" && chmod 755 "$ENGINE_BIN.new" && mv "$ENGINE_BIN.new" "$ENGINE_BIN"
   printf '%s\n' "$2" >"$ROOT/engine/VERSION"
   log "installed uzu $2 ($3); the previous engine is in engine/previous"
+}
+
+# A new engine must load the model, not just run: a build can start and still fail to create its Metal pipelines on this
+# macOS. With the model unloaded, start it once, wait for it to answer (one that cannot load exits and launchd records the
+# exit code), and unload it again.
+load_check() {
+  local deadline=$((SECONDS + 900)) code=""
+  "$ROOT/bin/uzuctl" engine start --no-wait >/dev/null 2>&1
+  while ((SECONDS < deadline)); do
+    if http_ok "http://127.0.0.1:$ENGINE_PORT/v1/models"; then "$ROOT/bin/uzuctl" engine stop >/dev/null 2>&1; return 0; fi
+    code=$(launchctl print "$DOMAIN/$ENGINE_LABEL" 2>/dev/null | awk '/last exit code/ {print $NF; exit}')
+    [[ $code =~ ^-?[0-9]+$ && $code != 0 ]] && break
+    sleep 2
+  done
+  "$ROOT/bin/uzuctl" engine stop >/dev/null 2>&1
+  return 1
 }
 
 rollback() {
@@ -74,15 +119,37 @@ if [[ -z $latest ]]; then
   results+=("uzu engine|$before||could not check GitHub")
 elif ! version_gt "$latest" "$before_tag"; then
   results+=("uzu engine|$before|$before|current")
+elif held_for_macos "$latest"; then
+  results+=("uzu engine|$before|$latest|available: waits for macOS $NEEDS_MACOS (on $(sw_vers -productVersion) it would read prompts about 4x slower)")
 else
   rm -rf "$WORK" && mkdir -p "$WORK"
   how="" candidate="" candidate_version=""
-  # 1. Mirai's ready-made build, verified against the SHA-256 GitHub publishes for it
+  # 1. uzu Home's ready-made engine for this uzu release (patched, signed ad hoc, in a release of uzu Home)
+  home_asset="uzu-engine-$latest-macos-arm64.tar.gz"
+  home_url=$(github "$HOME_API" | py "import json,sys
+for r in json.load(sys.stdin):
+    for a in r.get('assets', []):
+        if a.get('name') == '$home_asset' and (a.get('digest') or '').startswith('sha256:'):
+            print(a['browser_download_url'] + ' ' + a['digest'][7:]); sys.exit(0)" 2>/dev/null)
+  read -r h_url h_sha <<<"$home_url"
+  if [[ -n ${h_url:-} ]]; then
+    if [[ $mode == --check ]]; then
+      candidate=check how="uzu Home's build, a download"
+    elif download_verified "$h_url" "$h_sha" "$WORK/$home_asset" && mkdir -p "$WORK/home" &&
+      tar -xzf "$WORK/$home_asset" -C "$WORK/home" 2>/dev/null && [[ -x $WORK/home/uzu ]] &&
+      runs_here "$WORK/home/uzu" && engine_healthy "$WORK/home/uzu"; then
+      candidate="$WORK/home/uzu" candidate_version=$(tr -d ' \n' <"$WORK/home/VERSION" 2>/dev/null || echo "$latest")
+      how="uzu Home's build"
+    else
+      log "uzu Home's $latest engine did not verify or does not run here"
+    fi
+  fi
+  # 2. Mirai's ready-made build, verified against the SHA-256 GitHub publishes for it
   url=$(printf '%s' "$release" | py "import json,sys
 for a in json.load(sys.stdin).get('assets', []):
     if a.get('name') == '$ASSET': print(a.get('browser_download_url', '') + ' ' + (a.get('digest') or ''))" 2>/dev/null)
   read -r asset_url digest <<<"$url"
-  if [[ -n ${asset_url:-} && ${digest:-} == sha256:* ]] &&
+  if [[ -z $candidate && -n ${asset_url:-} && ${digest:-} == sha256:* ]] &&
     /usr/bin/curl -fsSL --max-time 300 -o "$WORK/$ASSET" "$asset_url" 2>/dev/null &&
     [[ $(shasum -a 256 "$WORK/$ASSET" | cut -d' ' -f1) == "${digest#sha256:}" ]] &&
     tar -xzf "$WORK/$ASSET" -C "$WORK" 2>/dev/null; then
@@ -93,7 +160,7 @@ for a in json.load(sys.stdin).get('assets', []):
       log "Mirai's $latest build does not fit (needs a newer macOS or lacks --context-length)"
     fi
   fi
-  # 2. a source build with uzu Home's patch
+  # 3. a source build with uzu Home's patches
   if [[ -z $candidate ]] && can_build; then
     how="source build"
     if [[ $mode == --check ]]; then
@@ -139,6 +206,16 @@ if ((changed)) && is_loaded "$ENGINE_LABEL"; then
     fi
   else
     log "engine busy; the new version loads at its next start"
+  fi
+elif ((changed)) && [[ $mode != --check && ${UZU_UPDATE_SKIP_LOAD_CHECK:-0} != 1 ]]; then
+  log "loading the model once on the new engine to check it"
+  if load_check; then
+    log "the new engine loads the model"
+  else
+    log "the new engine did not load the model; putting the previous one back"
+    rollback
+    failed=1
+    results+=("uzu engine|$(engine_version)||rolled back: the new engine could not load the model on this Mac")
   fi
 fi
 

@@ -108,6 +108,7 @@ final class AppModel: ObservableObject {
     @Published var catalog: [CatalogModel] = []
     @Published var converting = false
     @Published var convertOutput = ""
+    @Published var contextChange: ContextChange?     // the model reloading at a new context size (ContextWindow.swift)
 
     var windowVisible = true
     var persist = true                        // false for --screenshot / --probe runs: nothing is saved
@@ -364,18 +365,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func setContext(_ n: Int, restart: Bool) {
-        EnvFile(url: Paths.configEnv).set("CONTEXT", String(n))
-        reloadFiles(force: true)
-        if restart && (engineLoaded || runState == .loading) {
-            toast(.info, "Restarting the model", "With a \(Fmt.k(Double(n))) context.", seconds: 4)
-            self.restart()
-        } else if engineLoaded {
-            toast(.success, "Context saved", "\(Fmt.k(Double(n))) is used from the next start.", seconds: 8, action: "Restart now") { [weak self] in self?.restart() }
-        } else {
-            toast(.success, "Context saved", "\(Fmt.k(Double(n))) is used when the model next loads.")
-        }
-    }
+    func setContext(_ n: Int, restart: Bool) { changeContext(to: n, reload: restart) }
 
     func setSessions(_ n: Int) {
         guard n != sessions else { return }
