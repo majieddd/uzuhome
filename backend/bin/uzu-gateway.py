@@ -302,13 +302,14 @@ def engine_reserves_context(version):
     return tag < (0, 6, 17)
 
 
-def process_footprint(pid):
-    """A process's physical footprint in bytes (what Activity Monitor calls Memory), from footprint(1)."""
+def process_footprint(pid, peak=False):
+    """A process's physical footprint in bytes (what Activity Monitor calls Memory), or its peak since it started,
+    from footprint(1)."""
     try:
         out = subprocess.run(["/usr/bin/footprint", "-p", str(pid)], capture_output=True, text=True, timeout=20).stdout
     except Exception:
         return None
-    m = re.search(r"phys_footprint:\s+([\d.]+)\s*([KMG])B", out)
+    m = re.search(r"phys_footprint%s:\s+([\d.]+)\s*([KMG])B" % ("_peak" if peak else ""), out)
     if not m:
         return None
     return int(float(m.group(1)) * {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}[m.group(2)])
@@ -653,9 +654,17 @@ class Engine:
         """The engine's memory a few seconds after it loaded, the base of the app's context estimate."""
         time.sleep(3)
         _, running, pid, _ = launchd_engine()
-        size = process_footprint(pid) if running and pid else None
+        size = process_footprint(pid, peak=True) if running and pid else None
         if size:
             self.load_bytes, self.load_context, self.load_sessions, self.load_model = size, cfg["context"], cfg["sessions"], cfg["model"]["key"]
+
+    def remeasure_load(self):
+        """uzu touches a conversation's memory only once the conversation is used, so the footprint right after a load
+        undercounts; keep the engine's peak since then (reset when it restarts)."""
+        _, running, pid, _ = launchd_engine()
+        size = process_footprint(pid, peak=True) if running and pid else None
+        if size and self.load_bytes:
+            self.load_bytes = max(self.load_bytes, size)
 
     def poll_loop(self):
         """Every second: health and history; every IDLE_CHECK_S (20 s): the idle check."""
@@ -675,6 +684,8 @@ class Engine:
                 self.rec.sample()
                 if time.time() - last_idle_check >= IDLE_CHECK_S:
                     last_idle_check = time.time()
+                    if up and self.load_bytes:
+                        threading.Thread(target=self.remeasure_load, daemon=True).start()
                     idle_s = cfg["idle_minutes"] * 60
                     with self.rec.lock:
                         busy = bool(self.rec.live)
@@ -730,7 +741,10 @@ def memory_model(cfg, info):
     kv = info.get("kv_bytes_per_token") or 0
     if getattr(ENGINE, "load_bytes", None) and getattr(ENGINE, "load_model", None) == cfg["model"]["key"]:
         reserved = kv * ENGINE.load_context * ENGINE.load_sessions if reserves else 0
-        info["base_bytes"] = max(0, ENGINE.load_bytes - reserved)
+        # a window set aside but not yet used isn't in the footprint, so the difference can fall below the weights;
+        # the loaded model is never less than its weights plus the runtime (0.6 GB measured on a 9B with uzu 0.6.3)
+        floor = info["weights_bytes"] + 600_000_000 if info.get("weights_bytes") else 0
+        info["base_bytes"] = max(floor, ENGINE.load_bytes - reserved)
         info["measured_load_bytes"] = ENGINE.load_bytes
     elif info.get("weights_bytes"):
         info["base_bytes"] = info["weights_bytes"] + (1_100_000_000 if reserves else 2_700_000_000)
