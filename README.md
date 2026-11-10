@@ -1,5 +1,12 @@
 # uzu Home
 
+> **Development has moved to [8gent](https://github.com/majieddd/8gent).** 8gent is one app for every
+> loader (uzu, TensorFold, llama.cpp, Ollama, LM Studio, Strata) with one endpoint, and it takes over
+> uzu Home's setup on its first run: the selected model, context window, network sharing and memory
+> mode, and it answers on uzu Home's port too. uzu Home keeps working as it is but gets no new versions.
+> To move: `uzuctl login off`, `uzuctl gateway stop`, `uzuctl engine stop`, `uzuctl autoupdate off`, then
+> install 8gent from https://downloads.kr8.app/8gent/.
+
 **An unofficial Mac app for [uzu](https://github.com/trymirai/uzu)**, Mirai's inference engine for Apple silicon. It runs
 uzu's model server in the background and keeps one stable endpoint for Hermes and any other OpenAI-compatible app.
 It gives you a native window in the style of [StrataHome](https://github.com/majieddd/stratahome) and
